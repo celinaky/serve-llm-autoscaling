@@ -53,9 +53,7 @@ class AIPerfRunner:
     def executable(self) -> str:
         executable = shutil.which("aiperf")
         if executable is None:
-            raise RuntimeError(
-                "aiperf is not available on PATH; run `uv sync --extra dev` first"
-            )
+            raise RuntimeError("aiperf not found; run `uv tool install aiperf==0.11.0`")
         return executable
 
     def build_command(self, level: float, artifact_dir: Path) -> list[str]:

@@ -9,10 +9,9 @@ description = "Experiment harness for Ray Serve LLM autoscaling"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "aiperf==0.11.0",
-    "httpx>=0.27,<1",
-    "pydantic>=2.10,<3",
-    "pyyaml>=6,<7",
+    "pydantic>=2",
+    "pyyaml",
+    "requests",
 ]
 
 [project.optional-dependencies]

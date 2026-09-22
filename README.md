@@ -14,43 +14,41 @@ synthetic prefill-heavy workload (8,000 input tokens and 50 output tokens).
 
 ## Setup in an Anyscale workspace
 
-The environment must reuse the Ray installation provided by Anyscale. Do not
-install a second Ray wheel into the project environment.
+Run the harness on the Anyscale image's Python, so the
+Ray driver matches the workers. AIPerf is installed separately because its
+dependencies conflict with the image's.
 
 ```bash
-uv venv --system-site-packages
-uv sync --extra dev
-uv run autoscale-harness check
+pip install -e ".[dev]"
+uv tool install aiperf==0.11.0
+autoscale-harness check
 ```
-
-Manual activation is not required. If `.venv` was originally created without
-`--system-site-packages`, recreate it with the command above before syncing.
 
 ## Run
 
 Validate the experiment without touching the cluster:
 
 ```bash
-uv run autoscale-harness validate experiments/baseline.yaml
+autoscale-harness validate experiments/baseline.yaml
 ```
 
 Run the complete lifecycle:
 
 ```bash
-uv run autoscale-harness run experiments/baseline.yaml
+autoscale-harness run experiments/baseline.yaml
 ```
 
 If the dedicated workspace already has a Serve application, explicitly allow
 replacement:
 
 ```bash
-uv run autoscale-harness run experiments/baseline.yaml --replace
+autoscale-harness run experiments/baseline.yaml --replace
 ```
 
 Keep the deployment alive for debugging:
 
 ```bash
-uv run autoscale-harness run experiments/baseline.yaml --keep-deployment
+autoscale-harness run experiments/baseline.yaml --keep-deployment
 ```
 
 Results are written below `runs/<UTC timestamp>-<experiment name>/`. Every run

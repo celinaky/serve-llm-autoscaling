@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin
 
-import httpx
+import requests
 
 from .config import ExperimentConfig
 
@@ -119,7 +119,7 @@ class RayServeBackend:
         while time.monotonic() < deadline:
             try:
                 status = self.status()
-                response = httpx.get(models_url, timeout=5)
+                response = requests.get(models_url, timeout=5)
                 response.raise_for_status()
                 body = response.json()
                 ids = [item.get("id") for item in body.get("data", [])]
