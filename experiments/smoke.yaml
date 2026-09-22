@@ -1,0 +1,25 @@
+name: qwen-smoke
+
+deployment:
+  model_id: Qwen/Qwen3-0.6B-FP8
+  engine:
+    max_model_len: 2048
+  autoscaling:
+    min_replicas: 1
+    initial_replicas: 1
+    max_replicas: 1
+
+benchmark:
+  mode: concurrency
+  levels: [1]
+  duration_s: 20
+  grace_period_s: 10
+  warmup:
+    enabled: false
+  workload:
+    input_tokens: 256
+    output_tokens: 32
+  fail_fast: true
+
+runtime:
+  readiness_timeout_s: 600
