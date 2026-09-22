@@ -1,0 +1,48 @@
+name: qwen-single-replica-baseline
+
+deployment:
+  application_name: ttft-benchmark
+  model_id: Qwen/Qwen3-0.6B-FP8
+  model_source: Qwen/Qwen3-0.6B-FP8
+  route_prefix: /
+  direct_streaming: false
+  engine:
+    tensor_parallel_size: 1
+    max_model_len: 10000
+    gpu_memory_utilization: 0.95
+    max_num_seqs: 128
+    max_num_batched_tokens: 16384
+    enable_prefix_caching: false
+    kv_cache_dtype: fp8
+  autoscaling:
+    min_replicas: 1
+    initial_replicas: 1
+    max_replicas: 1
+    target_ongoing_requests: 4
+    upscale_delay_s: 30
+    downscale_delay_s: 600
+  max_ongoing_requests: 8192
+
+benchmark:
+  generator: aiperf
+  mode: concurrency
+  levels: [1, 2, 4, 8]
+  duration_s: 120
+  warmup:
+    enabled: true
+    duration_s: 30
+  workload:
+    type: synthetic
+    input_tokens: 8000
+    output_tokens: 50
+    seed: 42
+    ignore_eos: true
+  streaming: true
+  fail_fast: false
+
+runtime:
+  endpoint_url: http://127.0.0.1:8000
+  readiness_timeout_s: 1200
+  keep_deployment: false
+  results_dir: runs
+
