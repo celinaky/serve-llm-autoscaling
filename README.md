@@ -15,12 +15,11 @@ synthetic prefill-heavy workload (8,000 input tokens and 50 output tokens).
 ## Setup in an Anyscale workspace
 
 Run the harness on the Anyscale image's Python, so the
-Ray driver matches the workers. AIPerf is installed separately because its
-dependencies conflict with the image's.
+Ray driver matches the workers. AIPerf runs through `uvx` in its own cached
+environment because its dependencies conflict with the image's.
 
 ```bash
 pip install -e ".[dev]"
-uv tool install aiperf==0.11.0
 autoscale-harness check
 ```
 

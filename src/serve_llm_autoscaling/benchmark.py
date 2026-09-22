@@ -11,6 +11,14 @@ from typing import Any
 
 from .config import ExperimentConfig
 
+AIPERF_COMMAND = ["uvx", "--from", "aiperf==0.11.0", "aiperf"]
+
+
+def aiperf_command() -> list[str]:
+    if shutil.which("uvx") is None:
+        raise RuntimeError("uvx not on PATH; install uv to run AIPerf")
+    return list(AIPERF_COMMAND)
+
 
 def _metric_value(data: dict[str, Any], key: str, stat: str = "avg") -> Any:
     value = data.get(key)
@@ -50,18 +58,12 @@ class AIPerfRunner:
     config: ExperimentConfig
     benchmark_root: Path
 
-    def executable(self) -> str:
-        executable = shutil.which("aiperf")
-        if executable is None:
-            raise RuntimeError("aiperf not found; run `uv tool install aiperf==0.11.0`")
-        return executable
-
     def build_command(self, level: float, artifact_dir: Path) -> list[str]:
         benchmark = self.config.benchmark
         workload = benchmark.workload
         deployment = self.config.deployment
         cmd = [
-            self.executable(),
+            *aiperf_command(),
             "profile",
             "--model", deployment.model_id,
             "--tokenizer", str(deployment.tokenizer),

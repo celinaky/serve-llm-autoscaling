@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+from serve_llm_autoscaling import benchmark
 from serve_llm_autoscaling.benchmark import AIPerfRunner, normalize_aiperf
 from serve_llm_autoscaling.config import load_config
 
@@ -8,9 +9,9 @@ from serve_llm_autoscaling.config import load_config
 def test_build_concurrency_command(monkeypatch, tmp_path: Path):
     config = load_config("experiments/baseline.yaml")
     runner = AIPerfRunner(config, tmp_path)
-    monkeypatch.setattr(runner, "executable", lambda: "/bin/aiperf")
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
     command = runner.build_command(4.0, tmp_path / "point")
-    assert command[:2] == ["/bin/aiperf", "profile"]
+    assert command[:5] == ["uvx", "--from", "aiperf==0.11.0", "aiperf", "profile"]
     assert command[command.index("--concurrency") + 1] == "4"
     assert command[command.index("--isl") + 1] == "8000"
     assert command[command.index("--osl") + 1] == "50"
@@ -21,7 +22,7 @@ def test_build_request_rate_command(monkeypatch, tmp_path: Path):
     config = load_config("experiments/baseline.yaml")
     config.benchmark.mode = "request_rate"
     runner = AIPerfRunner(config, tmp_path)
-    monkeypatch.setattr(runner, "executable", lambda: "/bin/aiperf")
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
     command = runner.build_command(2.5, tmp_path / "point")
     assert command[command.index("--request-rate") + 1] == "2.5"
     assert command[command.index("--arrival-pattern") + 1] == "poisson"

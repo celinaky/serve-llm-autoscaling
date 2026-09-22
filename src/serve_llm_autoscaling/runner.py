@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import platform
-import shutil
 import subprocess
 import sys
 import time
@@ -10,19 +9,14 @@ from typing import Any
 
 from .artifacts import RunArtifacts, write_json
 from .backend import RayServeBackend
-from .benchmark import AIPerfRunner
+from .benchmark import AIPerfRunner, aiperf_command
 from .config import ExperimentConfig
 
 
 def _aiperf_version() -> str:
     completed = subprocess.run(
-        [shutil.which("aiperf") or "aiperf", "--version"],
-        capture_output=True,
-        text=True,
-        check=False,
+        [*aiperf_command(), "--version"], capture_output=True, text=True, check=True
     )
-    if completed.returncode != 0:
-        raise RuntimeError("aiperf not found; run `uv tool install aiperf==0.11.0`")
     return completed.stdout.strip()
 
 
@@ -37,7 +31,6 @@ def environment_check(connect: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "python_version": platform.python_version(),
         "python_executable": sys.executable,
-        "aiperf_path": shutil.which("aiperf"),
         "aiperf_version": _aiperf_version(),
     }
     result.update({"ray_version": ray.__version__, "ray_path": ray.__file__})
