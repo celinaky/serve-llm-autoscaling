@@ -140,6 +140,17 @@ def format_run_summary(root: Path) -> str:
                 f"{_fmt(p.get('p50_tpot_ms'), '.2f', 'ms'):>11}"
                 f"{_fmt(p.get('p99_e2el_ms'), '.1f', 'ms'):>11}"
             )
+    windows = _read_json(root / "benchmark" / "request-rate-series" / "windows.json")
+    if windows:
+        lines += ["", f"{'window':>9}{'sent/s':>8}{'done/s':>8}{'inflight':>10}"
+                      f"{'failed':>8}{'TTFT p50':>11}{'TTFT p99':>11}"]
+        for w in windows:
+            lines.append(
+                f"{w['window_start_s']:>8}s{w['sent_rps']:>8.1f}{w['completed_rps']:>8.1f}"
+                f"{w['in_flight_at_end']:>10}{w['failed_requests']:>8}"
+                f"{_fmt(w['p50_ttft_ms'], '.0f', 'ms'):>11}"
+                f"{_fmt(w['p99_ttft_ms'], '.0f', 'ms'):>11}"
+            )
     return "\n".join(lines) + "\n"
 
 

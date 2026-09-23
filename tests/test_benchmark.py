@@ -96,7 +96,12 @@ def test_run_series(monkeypatch, tmp_path: Path):
         (artifact_dir / "profile_export_aiperf.json").write_text(
             json.dumps({"request_count": {"avg": 40}})
         )
-        (artifact_dir / "profile_export.jsonl").write_text("{}\n")
+        record = {
+            "metadata": {"credit_issued_ns": 1, "request_end_ns": 2,
+                         "benchmark_phase": "profiling"},
+            "metrics": {},
+        }
+        (artifact_dir / "profile_export.jsonl").write_text(json.dumps(record) + "\n")
         return benchmark.subprocess.CompletedProcess(cmd, 0)
 
     monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
@@ -109,7 +114,7 @@ def test_run_series(monkeypatch, tmp_path: Path):
     assert row["error"] is None
     assert row["artifact_dir"] == str(series_dir)
     for name in ["rate_series.json", "command.json", "stdout.log", "stderr.log",
-                 "profile_export.jsonl"]:
+                 "profile_export.jsonl", "windows.json"]:
         assert (series_dir / name).exists()
     assert "--request-rate-series" in json.loads(
         (series_dir / "command.json").read_text()

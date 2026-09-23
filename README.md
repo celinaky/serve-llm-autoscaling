@@ -129,6 +129,7 @@ benchmark/
 │   ├── stdout.log
 │   ├── stderr.log
 │   ├── profile_export.jsonl      # per-request AIPerf records
+│   ├── windows.json              # per-10s-window summary by send time
 │   └── profile_export_aiperf.json
 └── sweep_summary.json            # aggregate metrics for the complete series
 ```

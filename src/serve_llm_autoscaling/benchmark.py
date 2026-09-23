@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ExperimentConfig
+from .windows import windowed_summary
 
 # AIPerf 0.12 needs Python 3.11+, which the Ray image's driver may not have.
 AIPERF_COMMAND = ["uvx", "--python", "3.11", "--from", "aiperf==0.12.0", "aiperf"]
@@ -143,7 +144,15 @@ class AIPerfRunner:
         series_path = series_dir / "rate_series.json"
         self.write_rate_series(series_path)
         cmd = self.build_series_command(series_path, series_dir)
-        return self._execute(cmd, series_dir, "series")
+        row = self._execute(cmd, series_dir, "series")
+        try:
+            windows = windowed_summary(series_dir, self.config.benchmark.duration_s)
+        except Exception as exc:  # Keep AIPerf's result if windowing fails.
+            row["windows_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            with (series_dir / "windows.json").open("w") as fh:
+                json.dump(windows, fh, indent=2)
+        return row
 
     def _execute(self, cmd: list[str], point_dir: Path, level: Any) -> dict[str, Any]:
         with (point_dir / "command.json").open("w") as fh:
