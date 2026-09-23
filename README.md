@@ -20,8 +20,14 @@ environment because its dependencies conflict with the image's.
 
 ```bash
 pip install -e ".[dev]"
+pip install "quack-kernels==0.6.3" "nvidia-cutlass-dsl==4.6.0"
 autoscale-harness check
 ```
+
+The second `pip install` works around an image bug: its vLLM 0.26.0 pins
+`nvidia-cutlass-dsl==4.6.0`, but the bundled `quack-kernels` 0.4.1 is
+incompatible with it and fails engine startup with
+`AttributeError: module 'cutlass.cute.core' has no attribute 'ThrMma'`.
 
 ## Run
 
