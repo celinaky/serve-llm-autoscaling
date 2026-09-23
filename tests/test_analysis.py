@@ -32,20 +32,16 @@ def _request(credit_s, end_s, ttft=100.0):
             "metrics": {"time_to_first_token": {"value": ttft}}}
 
 
-def _status(t_s, target, states, error=None):
+def _status(t_s, states, error=None):
     if error:
         return {"timestamp_ns": T0 + int(t_s * S), "application": APP,
-                "application_status": None, "deployments": {}, "error": error}
-    replicas = [{"replica_id": f"r{i}", "state": state, "node_id": "n1", "actor_id": f"a{i}"}
-                for i, state in enumerate(states)]
+                "application_status": None, "deployments": {}, "available": False,
+                "error": error}
     deployment = {"status": "HEALTHY", "status_trigger": "AUTOSCALING",
-                  "target_num_replicas": target, "live_replicas": len(states),
-                  "replicas_by_state": {s: states.count(s) for s in set(states)},
-                  "replicas": replicas}
-    ingress = {**deployment, "target_num_replicas": 1, "live_replicas": 1,
-               "replicas_by_state": {"RUNNING": 1}, "replicas": []}
+                  "replica_states": {s: states.count(s) for s in set(states)}}
+    ingress = {**deployment, "replica_states": {"RUNNING": 1}}
     return {"timestamp_ns": T0 + int(t_s * S), "application": APP,
-            "application_status": "RUNNING", "error": None,
+            "application_status": "RUNNING", "available": True, "error": None,
             "deployments": {LLM: deployment, INGRESS: ingress}}
 
 
@@ -85,11 +81,11 @@ def make_run(root: Path, *, status=True, metrics=True) -> Path:
            [_request(t, t + 0.5, ttft=100 + t) for t in range(0, 300, 2)])
     if status:
         _jsonl(root / "telemetry" / "serve_status.jsonl", [
-            _status(-10, 1, ["RUNNING"]),
-            _status(2, 1, ["RUNNING"]),
-            _status(3, None, [], error="ConnectionError: controller"),
-            _status(90, 3, ["RUNNING", "STARTING", "STARTING"]),
-            _status(150, 3, ["RUNNING", "RUNNING", "RUNNING"]),
+            _status(-10, ["RUNNING"]),
+            _status(2, ["RUNNING"]),
+            _status(3, [], error="ConnectionError: controller"),
+            _status(90, ["RUNNING", "STARTING", "STARTING"]),
+            _status(150, ["RUNNING", "RUNNING", "RUNNING", "STOPPING"]),
         ])
     if metrics:
         labels = {"application": APP, "deployment": LLM}
@@ -100,7 +96,7 @@ def make_run(root: Path, *, status=True, metrics=True) -> Path:
                 _sample("ray_serve_replica_processing_queries", 9, replica="x",
                         application=APP, deployment=INGRESS),
                 _sample("ray_serve_request_router_queue_len", 2, replica_id="r0",
-                        actor_id="router", **labels),
+                        actor_id="router", handle_source="REPLICA", **labels),
                 _sample("ray_serve_autoscaling_desired_replicas", 1 + (t >= 90) * 2, **labels),
                 _sample("ray_serve_autoscaling_target_replicas", 1 + (t >= 90) * 2, **labels),
             ])
@@ -133,10 +129,31 @@ def test_replica_counts_remain_step_data(tmp_path: Path):
     # Kept at their own timestamps, not averaged into request windows.
     assert len(samples) == 5
     upscaling = samples[3]
-    assert upscaling["target_replicas"] == 3  # the LLM deployment only, not the ingress
+    # The LLM deployment only, not the ingress.
     assert (upscaling["running_replicas"], upscaling["starting_replicas"]) == (1, 2)
-    assert samples[2]["error"] and "target_replicas" not in samples[2]
+    assert upscaling["live_replicas"] == 3
+    assert samples[4]["stopping_replicas"] == 1 and samples[4]["live_replicas"] == 4
+    assert samples[2]["error"] and "running_replicas" not in samples[2]
     assert "1 of 5 Serve status samples failed" in data["warnings"]
+
+
+def test_missing_application_is_a_gap_not_zero(tmp_path: Path):
+    from serve_llm_autoscaling.analysis import status_samples
+
+    missing = {"timestamp_ns": T0, "application": APP, "application_status": None,
+               "deployments": {}, "available": False,
+               "error": "configured application not present"}
+    other = {**_status(1, ["RUNNING"]), "deployments": {INGRESS: {"replica_states": {}}}}
+    samples = status_samples([missing, other], {LLM}, T0)
+    assert all(s["error"] and "running_replicas" not in s for s in samples)
+    assert samples[1]["error"] == "no matching deployment in Serve status"
+
+
+def test_old_status_records_are_read():
+    from serve_llm_autoscaling.analysis import status_samples
+
+    old = {**_status(0, []), "deployments": {LLM: {"replicas_by_state": {"RUNNING": 2}}}}
+    assert status_samples([old], {LLM}, T0)[0]["running_replicas"] == 2
 
 
 def test_primary_plot_excludes_pre_profile_samples():
@@ -166,13 +183,30 @@ def test_duplicate_controller_metrics_are_not_summed():
     samples = [("n1", _sample("serve_autoscaling_desired_replicas", 3, **labels)),
                ("n2", _sample("serve_autoscaling_desired_replicas", 3, **labels))]
     warnings = []
-    points = aggregate_metric([(T0, samples)], "unique", T0, warnings, "desired")
-    assert points == [{"relative_time_s": 0.0, "value": 3, "series_count": 2}]
+    points = aggregate_metric([(T0, samples)], "sum", (), T0, warnings, "desired")
+    assert points == [{"relative_time_s": 0.0, "value": 3, "series_count": 1}]
     assert warnings == []
-    conflicting = [samples[0], ("n2", _sample("serve_autoscaling_desired_replicas", 2,
-                                              **labels))]
-    points = aggregate_metric([(T0, conflicting)], "unique", T0, warnings, "desired")
-    assert points[0]["value"] == 3 and "conflicting" in warnings[0]
+
+
+def test_conflicting_controller_metrics_are_omitted():
+    labels = {"application": APP, "deployment": LLM}
+    conflicting = [("n1", _sample("serve_autoscaling_desired_replicas", 3, **labels)),
+                   ("n2", _sample("serve_autoscaling_desired_replicas", 2, **labels))]
+    agreeing = [("n1", _sample("serve_autoscaling_desired_replicas", 4, **labels))]
+    warnings = []
+    points = aggregate_metric([(T0, conflicting), (T0 + S, agreeing)], "sum", (), T0,
+                              warnings, "desired")
+    assert points == [{"relative_time_s": 1.0, "value": 4, "series_count": 1}]
+    assert "omitted 1 scrapes" in warnings[0]
+
+
+def test_additive_metrics_without_identity_are_excluded():
+    labels = {"application": APP, "deployment": LLM}
+    samples = [("n1", _sample("serve_replica_processing_queries", 4, **labels)),
+               ("n2", _sample("serve_replica_processing_queries", 4, **labels))]
+    warnings = []
+    assert aggregate_metric([(T0, samples)], "sum", ("replica",), T0, warnings, "q") == []
+    assert "missing identity labels ['replica']" in warnings[0]
 
 
 def test_per_replica_summation():
@@ -180,7 +214,8 @@ def test_per_replica_summation():
     samples = [("n1", _sample("serve_replica_processing_queries", 4, replica="a", **labels)),
                ("n2", _sample("serve_replica_processing_queries", 5, replica="b", **labels)),
                ("n1", _sample("serve_replica_processing_queries", None, replica="c", **labels))]
-    points = aggregate_metric([(T0, samples), (T0 + S, [])], "sum", T0, [], "ongoing")
+    points = aggregate_metric([(T0, samples), (T0 + S, [])], "sum", ("replica",), T0, [],
+                              "ongoing")
     assert points == [{"relative_time_s": 0.0, "value": 9, "series_count": 2}]  # no zero gap
 
 
@@ -188,10 +223,8 @@ def test_healthy_replica_count():
     per_replica = [("n1", _sample("serve_deployment_replica_healthy", v, replica=r,
                                   application=APP, deployment=LLM))
                    for r, v in (("a", 1), ("b", 0), ("c", 1))]
-    assert aggregate_metric([(T0, per_replica)], "healthy", T0, [], "h")[0]["value"] == 2
-    aggregate = [("n1", _sample("serve_deployment_replica_healthy", 3, application=APP,
-                                deployment=LLM))]
-    assert aggregate_metric([(T0, aggregate)], "healthy", T0, [], "h")[0]["value"] == 3
+    points = aggregate_metric([(T0, per_replica)], "healthy", ("replica",), T0, [], "h")
+    assert points[0]["value"] == 2
 
 
 def test_counter_deltas_are_node_local():
@@ -203,17 +236,16 @@ def test_counter_deltas_are_node_local():
 
     # n2 resets from 7 to 1 between the second and third scrape.
     points = aggregate_metric(
-        [tick(0, 2, 5), tick(1, 3, 7), tick(2, 3, 1)], "counter_delta", T0, [], "c"
+        [tick(0, 2, 5), tick(1, 3, 7), tick(2, 3, 1)], "counter_delta", (), T0, [], "c"
     )
     assert [(p["relative_time_s"], p["value"]) for p in points] == [(1.0, 3), (2.0, 1)]
 
 
-def test_unlabeled_series_are_kept_with_warning():
+def test_unlabeled_series_are_excluded_with_warning():
     records = [_scrape(0, 0, [_sample("ray_serve_replica_processing_queries", 2)])]
     warnings = []
-    series = metric_series(records, APP, {LLM}, 1, T0, warnings)
-    assert series["ongoing_requests"]["points"][0]["value"] == 2
-    assert "lack application/deployment labels" in warnings[0]
+    assert metric_series(records, APP, {LLM}, 1, T0, warnings) == {}
+    assert "excluded 1 samples without application/deployment labels" in warnings[0]
 
 
 def test_metrics_inventory(tmp_path: Path):

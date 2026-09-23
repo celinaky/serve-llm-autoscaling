@@ -164,9 +164,8 @@ def test_rejects_series_flags_in_extra_args(flag):
 
 def test_analysis_defaults():
     analysis = load_config(Path("experiments/step_rate.yaml")).analysis
-    assert (analysis.window_s, analysis.tail_window_s, analysis.telemetry_interval_s) == (
-        5, 30, 1
-    )
+    assert (analysis.window_s, analysis.tail_window_s) == (5, 30)
+    assert (analysis.status_interval_s, analysis.metrics_interval_s) == (1, 2)
     assert analysis.prometheus_enabled and analysis.generate_plots
     assert analysis.ttft_slo_ms is None
 

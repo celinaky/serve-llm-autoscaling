@@ -20,18 +20,28 @@ from .windows import request_timeseries
 SCHEMA_VERSION = 1
 SERIES_DIR = Path("benchmark") / "request-rate-series"
 
-# key -> (normalized sample name, aggregation)
+# key -> (normalized sample name, aggregation, identity labels)
+#
+# A series is identified by application, deployment and the identity labels:
+# the replica for replica metrics, the handle or router actor for router
+# metrics, nothing more for controller gauges. Copies of one series exported by
+# several nodes are deduplicated; samples missing an identity label are
+# excluded, since they cannot be told apart.
 METRIC_SERIES = {
-    "ongoing_requests": ("serve_replica_processing_queries", "sum"),
-    "handle_ongoing_requests": ("serve_num_ongoing_requests_at_replicas", "sum"),
-    "router_queue": ("serve_request_router_queue_len", "sum"),
-    "queued_queries": ("serve_deployment_queued_queries", "sum"),
-    "healthy_replicas": ("serve_deployment_replica_healthy", "healthy"),
-    "desired_replicas": ("serve_autoscaling_desired_replicas", "unique"),
-    "target_replicas": ("serve_autoscaling_target_replicas", "unique"),
-    "autoscaling_total_requests": ("serve_autoscaling_total_requests", "unique"),
-    "target_ongoing_requests": ("serve_autoscaling_target_ongoing_requests", "unique"),
-    "replica_startups": ("serve_replica_startup_latency_ms_count", "counter_delta"),
+    "ongoing_requests": ("serve_replica_processing_queries", "sum", ("replica",)),
+    "handle_ongoing_requests": (
+        "serve_num_ongoing_requests_at_replicas", "sum", ("handle", "actor_id")
+    ),
+    "router_queue": (
+        "serve_request_router_queue_len", "sum", ("actor_id", "handle_source", "replica_id")
+    ),
+    "queued_queries": ("serve_deployment_queued_queries", "sum", ("handle", "actor_id")),
+    "healthy_replicas": ("serve_deployment_replica_healthy", "healthy", ("replica",)),
+    "desired_replicas": ("serve_autoscaling_desired_replicas", "sum", ()),
+    "target_replicas": ("serve_autoscaling_target_replicas", "sum", ()),
+    "autoscaling_total_requests": ("serve_autoscaling_total_requests", "sum", ()),
+    "target_ongoing_requests": ("serve_autoscaling_target_ongoing_requests", "sum", ()),
+    "replica_startups": ("serve_replica_startup_latency_ms_count", "counter_delta", ()),
 }
 
 
@@ -59,6 +69,9 @@ def build_metrics_inventory(metrics_path: Path) -> dict[str, Any]:
     other: set[str] = set()
     endpoints: set[str] = set()
     scrapes = errors = 0
+    durations: list[float] = []
+    sizes: list[int] = []
+    overran: set[Any] = set()
     if metrics_path.exists():
         for record in read_jsonl(metrics_path):
             scrapes += 1
@@ -66,6 +79,12 @@ def build_metrics_inventory(metrics_path: Path) -> dict[str, Any]:
                 endpoints.add(record["endpoint"])
             if record.get("error"):
                 errors += 1
+            if record.get("scrape_duration_s") is not None:
+                durations.append(record["scrape_duration_s"])
+            if record.get("bytes") is not None:
+                sizes.append(record["bytes"])
+            if record.get("cycle_overran"):
+                overran.add(record.get("tick"))
             other.update(record.get("available_serve_metrics") or [])
             ts = record.get("timestamp_ns")
             for sample in record.get("samples") or []:
@@ -96,6 +115,10 @@ def build_metrics_inventory(metrics_path: Path) -> dict[str, Any]:
         "scrape_records": scrapes,
         "scrape_errors": errors,
         "endpoints": sorted(endpoints),
+        # Collector overhead, to check that scraping did not perturb the run.
+        "max_scrape_duration_s": max(durations, default=None),
+        "max_scrape_bytes": max(sizes, default=None),
+        "overran_cycles": len(overran),
         "metrics": dict(sorted(metrics.items())),
         "missing_recommended_metrics": [m for m in SELECTED_METRICS if m not in metrics],
         "other_available_serve_metrics": sorted(other - set(SELECTED_METRICS)),
@@ -111,9 +134,16 @@ def relevant_deployments(names: set[str]) -> set[str]:
     return llm or set(names)
 
 
+STARTING_STATES = ("STARTING", "RECOVERING")
+
+
 def status_samples(
     records: list[dict[str, Any]], deployments: set[str], t0: int
 ) -> list[dict[str, Any]]:
+    """Replica counts per status sample; unavailable samples carry only an error.
+
+    An absent application or deployment is a gap, never zero replicas.
+    """
     samples = []
     for record in records:
         sample = {
@@ -121,24 +151,23 @@ def status_samples(
             "timestamp_ns": record["timestamp_ns"],
             "error": record.get("error"),
         }
-        if not record.get("error"):
-            chosen = {
-                name: d for name, d in (record.get("deployments") or {}).items()
-                if name in deployments
-            }
+        chosen = [
+            d for name, d in (record.get("deployments") or {}).items() if name in deployments
+        ]
+        if not sample["error"] and not chosen:
+            sample["error"] = "no matching deployment in Serve status"
+        if not sample["error"]:
             states: dict[str, int] = defaultdict(int)
-            for d in chosen.values():
-                for state, n in (d.get("replicas_by_state") or {}).items():
+            for d in chosen:
+                # ``replicas_by_state`` is the key in runs recorded before serve.status().
+                for state, n in (d.get("replica_states") or d.get("replicas_by_state") or {}).items():
                     states[state] += n
-            targets = [d.get("target_num_replicas") for d in chosen.values()]
             sample.update({
                 "application_status": record.get("application_status"),
-                "target_replicas": (
-                    sum(targets) if targets and None not in targets else None
-                ),
-                "live_replicas": sum(d.get("live_replicas", 0) for d in chosen.values()),
+                "live_replicas": sum(n for state, n in states.items() if state != "STOPPED"),
                 "running_replicas": states.get("RUNNING", 0),
-                "starting_replicas": states.get("STARTING", 0),
+                "starting_replicas": sum(states.get(state, 0) for state in STARTING_STATES),
+                "stopping_replicas": states.get("STOPPING", 0),
                 "replicas_by_state": dict(states),
             })
         samples.append(sample)
@@ -155,6 +184,7 @@ def _label_key(labels: dict[str, str]) -> tuple:
 def aggregate_metric(
     ticks: list[tuple[int, list[tuple[str | None, dict[str, Any]]]]],
     aggregation: str,
+    identity: tuple[str, ...],
     t0: int,
     warnings: list[str],
     metric: str,
@@ -162,69 +192,66 @@ def aggregate_metric(
     """Aggregate one metric per scrape tick.
 
     ``ticks`` holds (timestamp_ns, [(node_id, sample), ...]) in time order.
-    Ticks without samples produce no point, so gaps are not zeros.
+    Ticks without samples produce no point, so gaps are not zeros. A tick in
+    which copies of one series disagree is omitted rather than guessed.
     """
     points = []
     previous: dict[tuple, float] = {}
-    conflicting = False
+    unidentified = conflicting = 0
     for timestamp_ns, samples in ticks:
-        value: float | None
-        series = {}
+        series: dict[tuple, set[float]] = defaultdict(set)
         for node_id, sample in samples:
-            if sample.get("value") is not None:
-                series[(node_id, _label_key(sample["labels"]))] = sample
+            labels = sample["labels"]
+            if sample.get("value") is None:
+                continue
+            if any(key not in labels for key in identity):
+                unidentified += 1
+                continue
+            key = (labels.get("application"), labels.get("deployment"),
+                   *(labels[k] for k in identity))
+            if aggregation == "counter_delta":
+                # Counters are node-local; deltas are taken per node series.
+                key = (node_id, _label_key(labels))
+            series[key].add(sample["value"])
+        if any(len(values) > 1 for values in series.values()):
+            conflicting += 1
+            continue
+        current = {key: values.pop() for key, values in series.items()}
+        value: float
         if aggregation == "counter_delta":
-            # Node-local deltas first; a drop means the counter reset.
+            # A drop means the counter reset.
             delta, seen = 0.0, False
-            for key, sample in series.items():
+            for key, v in current.items():
                 if key in previous:
-                    prior = previous[key]
-                    delta += sample["value"] - prior if sample["value"] >= prior else sample["value"]
+                    delta += v - previous[key] if v >= previous[key] else v
                     seen = True
-                previous[key] = sample["value"]
+                previous[key] = v
             if not seen:
                 continue
             value = delta
-        elif not series:
+        elif not current:
             continue
         elif aggregation == "sum":
-            # A series exported by two nodes is still one series.
-            unique = {labels: s["value"] for (_, labels), s in series.items()}
-            value = sum(unique.values())
+            value = sum(current.values())
         elif aggregation == "healthy":
-            per_replica = [s for s in series.values() if "replica" in s["labels"]]
-            if per_replica:
-                value = sum(
-                    1 for v in {_label_key(s["labels"]): s["value"] for s in per_replica}.values()
-                    if v >= 1
-                )
-            else:
-                value = _unique_deployment_sum(series.values())[0]
-        elif aggregation == "unique":
-            value, conflict = _unique_deployment_sum(series.values())
-            conflicting = conflicting or conflict
+            value = sum(1 for v in current.values() if v >= 1)
         else:
             raise ValueError(f"unknown aggregation {aggregation!r}")
         points.append({
             "relative_time_s": (timestamp_ns - t0) / 1e9,
             "value": value,
-            "series_count": len(series),
+            "series_count": len(current),
         })
+    if unidentified:
+        warnings.append(
+            f"{metric}: excluded {unidentified} samples missing identity labels "
+            f"{list(identity)}"
+        )
     if conflicting:
         warnings.append(
-            f"{metric}: nodes exported conflicting values for one deployment; used the maximum"
+            f"{metric}: omitted {conflicting} scrapes where copies of one series disagreed"
         )
     return points
-
-
-def _unique_deployment_sum(samples) -> tuple[float, bool]:
-    """Controller gauges: one value per application/deployment, never summed across nodes."""
-    by_deployment: dict[tuple, set[float]] = defaultdict(set)
-    for s in samples:
-        labels = s["labels"]
-        by_deployment[(labels.get("application"), labels.get("deployment"))].add(s["value"])
-    conflict = any(len(values) > 1 for values in by_deployment.values())
-    return sum(max(values) for values in by_deployment.values()), conflict
 
 
 def metric_series(
@@ -244,8 +271,8 @@ def metric_series(
             tick = round(record["timestamp_ns"] / 1e9 / interval_s)
         ticks[tick].append(record)
 
-    unlabeled: set[str] = set()
-    by_metric: dict[str, list] = {name: [] for name, _ in METRIC_SERIES.values()}
+    unlabeled: dict[str, int] = defaultdict(int)
+    by_metric: dict[str, list] = {name: [] for name, _, _ in METRIC_SERIES.values()}
     for tick in sorted(ticks):
         tick_records = ticks[tick]
         timestamp_ns = max(r["timestamp_ns"] for r in tick_records)
@@ -256,24 +283,24 @@ def metric_series(
                 if name not in by_metric:
                     continue
                 labels = sample.get("labels") or {}
-                if "application" in labels and labels["application"] != application:
-                    continue
-                if "deployment" in labels and labels["deployment"] not in deployments:
-                    continue
                 if "application" not in labels or "deployment" not in labels:
-                    unlabeled.add(name)
+                    unlabeled[name] += 1  # cannot be attributed to the deployment
+                    continue
+                if labels["application"] != application:
+                    continue
+                if labels["deployment"] not in deployments:
+                    continue
                 selected[name].append((record.get("node_id"), sample))
         for name in by_metric:
             by_metric[name].append((timestamp_ns, selected.get(name, [])))
 
     for name in sorted(unlabeled):
         warnings.append(
-            f"{name}: some series lack application/deployment labels and were kept; "
-            "they may include other deployments"
+            f"{name}: excluded {unlabeled[name]} samples without application/deployment labels"
         )
     result = {}
-    for key, (name, aggregation) in METRIC_SERIES.items():
-        points = aggregate_metric(by_metric[name], aggregation, t0, warnings, name)
+    for key, (name, aggregation, identity) in METRIC_SERIES.items():
+        points = aggregate_metric(by_metric[name], aggregation, identity, t0, warnings, name)
         if points:
             result[key] = {"metric": name, "aggregation": aggregation, "points": points}
     return result
@@ -331,7 +358,7 @@ def build_plot_data(
     if not metrics_path.exists():
         warnings.append("Prometheus metrics were not collected; Serve-side signals are omitted")
     series = metric_series(
-        metric_records, application, deployments, analysis.telemetry_interval_s, t0, warnings
+        metric_records, application, deployments, analysis.metrics_interval_s, t0, warnings
     )
     if metrics_path.exists():
         for key in ("ongoing_requests", "router_queue", "desired_replicas"):
@@ -365,7 +392,8 @@ def build_plot_data(
             "grace_period_s": config.benchmark.grace_period_s,
             "window_s": analysis.window_s,
             "tail_window_s": analysis.tail_window_s,
-            "telemetry_interval_s": analysis.telemetry_interval_s,
+            "status_interval_s": analysis.status_interval_s,
+            "metrics_interval_s": analysis.metrics_interval_s,
             "ttft_slo_ms": analysis.ttft_slo_ms,
         },
         "time_origin": {

@@ -10,7 +10,6 @@ import json
 import math
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -48,11 +47,13 @@ class JsonlCollector:
         sample: Callable[[int, int], list[dict[str, Any]]],
         error_record: Callable[[int, str], dict[str, Any]],
         name: str,
+        close: Callable[[], None] | None = None,
     ):
         self.path = path
         self.interval_s = interval_s
         self._sample = sample
         self._error_record = error_record
+        self._close = close
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name=name, daemon=True)
         self._fh = None
@@ -67,7 +68,12 @@ class JsonlCollector:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(timeout_s)
-        if self._fh is not None and not self._thread.is_alive():
+        if self._thread.is_alive():
+            return  # a hung sample still owns the file; the daemon thread dies with us
+        if self._close is not None:
+            self._close()
+            self._close = None
+        if self._fh is not None:
             self._fh.close()
 
     def __enter__(self) -> "JsonlCollector":
@@ -110,49 +116,65 @@ class JsonlCollector:
 # --- Serve status -----------------------------------------------------------
 
 
-def fetch_serve_details() -> dict[str, Any]:
-    """Serve instance details, keyed as in the public ``ServeInstanceDetails`` schema.
-
-    ``serve.status()`` is built from these details but drops per-replica
-    identities and target replica counts, which the timeline needs.
-    """
-    from ray.serve.context import _get_global_client
-
-    client = _get_global_client(raise_if_no_controller_running=False)
-    if client is None:
-        return {"applications": {}}
-    return client.get_serve_details()
-
-
 def _value(value: Any) -> Any:
     """Serve's status enums are str enums; record their plain values."""
     return getattr(value, "value", value)
 
 
-def serve_status_sample(
-    details: dict[str, Any], application: str, timestamp_ns: int
-) -> dict[str, Any]:
-    app = (details.get("applications") or {}).get(application) or {}
-    deployments = {}
-    for name, deployment in (app.get("deployments") or {}).items():
-        # Only ``replicas`` are live; ``recent_dead_replicas`` are history.
-        replicas = [
-            {key: _value(r.get(key)) for key in ("replica_id", "state", "node_id", "actor_id")}
-            for r in deployment.get("replicas") or []
-        ]
-        deployments[name] = {
-            "status": _value(deployment.get("status")),
-            "status_trigger": _value(deployment.get("status_trigger")),
-            "target_num_replicas": deployment.get("target_num_replicas"),
-            "live_replicas": len(replicas),
-            "replicas_by_state": dict(Counter(r["state"] for r in replicas)),
-            "replicas": replicas,
+def fetch_serve_status() -> dict[str, Any]:
+    """The public ``serve.status()`` as plain JSON-compatible data.
+
+    It reports replica counts by state but no target replica count; the
+    desired/target counts come from the autoscaling metrics instead.
+    """
+    from ray import serve
+
+    status = serve.status()
+    return {"applications": {
+        name: {
+            "status": _value(app.status),
+            "deployments": {
+                dep_name: {
+                    "status": _value(dep.status),
+                    "status_trigger": _value(dep.status_trigger),
+                    "replica_states": {
+                        _value(state): n for state, n in (dep.replica_states or {}).items()
+                    },
+                }
+                for dep_name, dep in (app.deployments or {}).items()
+            },
         }
+        for name, app in (status.applications or {}).items()
+    }}
+
+
+def serve_status_sample(
+    status: dict[str, Any], application: str, timestamp_ns: int
+) -> dict[str, Any]:
+    app = (status.get("applications") or {}).get(application)
+    if not app:
+        # Not zero replicas: the application is not there to be measured.
+        return {
+            "timestamp_ns": timestamp_ns, "application": application,
+            "application_status": None, "deployments": {}, "available": False,
+            "error": "configured application not present",
+        }
+    deployments = {
+        name: {
+            "status": _value(d.get("status")),
+            "status_trigger": _value(d.get("status_trigger")),
+            "replica_states": {
+                _value(state): n for state, n in (d.get("replica_states") or {}).items()
+            },
+        }
+        for name, d in (app.get("deployments") or {}).items()
+    }
     return {
         "timestamp_ns": timestamp_ns,
         "application": application,
         "application_status": _value(app.get("status")),
         "deployments": deployments,
+        "available": True,
         "error": None,
     }
 
@@ -161,15 +183,15 @@ def serve_status_collector(
     path: Path,
     application: str,
     interval_s: float,
-    fetch: Callable[[], dict[str, Any]] = fetch_serve_details,
+    fetch: Callable[[], dict[str, Any]] = fetch_serve_status,
 ) -> JsonlCollector:
     return JsonlCollector(
         path,
         interval_s,
         lambda ts, tick: [serve_status_sample(fetch(), application, ts)],
         lambda ts, error: {
-            "timestamp_ns": ts, "application": application,
-            "application_status": None, "deployments": {}, "error": error,
+            "timestamp_ns": ts, "application": application, "application_status": None,
+            "deployments": {}, "available": False, "error": error,
         },
         name="serve-status-collector",
     )
@@ -229,6 +251,7 @@ def parse_metrics(text: str) -> tuple[list[dict[str, Any]], list[str]]:
 
 
 def fetch_metrics_text(url: str) -> str:
+    # Ray's exporter ignores Prometheus' ``name[]`` filter, so this is the full export.
     response = requests.get(url, timeout=SCRAPE_TIMEOUT_S)
     response.raise_for_status()
     return response.text
@@ -236,28 +259,48 @@ def fetch_metrics_text(url: str) -> str:
 
 class _PrometheusSampler:
     def __init__(self, discover: Callable[[], list[dict[str, Any]]],
-                 fetch: Callable[[str], str]):
+                 fetch: Callable[[str], str], interval_s: float):
         self._discover = discover
         self._fetch = fetch
+        self._interval_s = interval_s
         self._pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="metrics-scrape")
         self._families: dict[str, list[str]] = {}
 
     def _scrape(self, endpoint: dict[str, Any]) -> dict[str, Any]:
-        record = {"timestamp_ns": time.time_ns(), **endpoint, "samples": [], "error": None}
+        url = endpoint["endpoint"]
+        started = time.time_ns()
+        record = {**endpoint, "scrape_started_at_ns": started, "samples": [], "error": None}
         try:
-            record["samples"], families = parse_metrics(self._fetch(endpoint["endpoint"]))
+            text = self._fetch(url)
+            record["bytes"] = len(text)
+            record["samples"], families = parse_metrics(text)
         except Exception as exc:
             record["error"] = _error(exc)
-            return record
+            families = None
+        # A gauge is read once the response arrives, so align on completion.
+        finished = time.time_ns()
+        record.update(scrape_finished_at_ns=finished, timestamp_ns=finished,
+                      scrape_duration_s=(finished - started) / 1e9)
         # The full Serve metric list is only written when it changes.
-        if self._families.get(endpoint["endpoint"]) != families:
-            self._families[endpoint["endpoint"]] = families
+        if families is not None and self._families.get(url) != families:
+            self._families[url] = families
             record["available_serve_metrics"] = families
         return record
 
     def __call__(self, timestamp_ns: int, tick: int) -> list[dict[str, Any]]:
+        started = time.monotonic()
         endpoints = discover_endpoints(self._discover())
-        return list(self._pool.map(self._scrape, endpoints))
+        if not endpoints:
+            raise RuntimeError("No live Ray metrics endpoints discovered")
+        records = list(self._pool.map(self._scrape, endpoints))
+        cycle_s = time.monotonic() - started
+        for record in records:
+            record["cycle_duration_s"] = cycle_s
+            record["cycle_overran"] = cycle_s > self._interval_s
+        return records
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True, cancel_futures=True)
 
 
 def prometheus_collector(
@@ -266,15 +309,17 @@ def prometheus_collector(
     discover: Callable[[], list[dict[str, Any]]] = ray_nodes,
     fetch: Callable[[str], str] = fetch_metrics_text,
 ) -> JsonlCollector:
+    sampler = _PrometheusSampler(discover, fetch, interval_s)
     return JsonlCollector(
         path,
         interval_s,
-        _PrometheusSampler(discover, fetch),
+        sampler,
         lambda ts, error: {
             "timestamp_ns": ts, "node_id": None, "node_ip": None,
             "endpoint": None, "samples": [], "error": error,
         },
         name="prometheus-collector",
+        close=sampler.close,
     )
 
 
@@ -286,7 +331,7 @@ class TelemetrySession:
         config: ExperimentConfig,
         root: Path,
         *,
-        status_fetch: Callable[[], dict[str, Any]] = fetch_serve_details,
+        status_fetch: Callable[[], dict[str, Any]] = fetch_serve_status,
         discover: Callable[[], list[dict[str, Any]]] = ray_nodes,
         fetch_metrics: Callable[[str], str] = fetch_metrics_text,
     ):
@@ -297,22 +342,31 @@ class TelemetrySession:
             serve_status_collector(
                 telemetry_dir / "serve_status.jsonl",
                 config.deployment.application_name,
-                analysis.telemetry_interval_s,
+                analysis.status_interval_s,
                 status_fetch,
             )
         ]
         if analysis.prometheus_enabled:
             self.collectors.append(prometheus_collector(
                 telemetry_dir / "serve_metrics.jsonl",
-                analysis.telemetry_interval_s,
+                analysis.metrics_interval_s,
                 discover,
                 fetch_metrics,
             ))
-        self._stop_timeout_s = analysis.telemetry_interval_s + SCRAPE_TIMEOUT_S + 5
+        self._stop_timeout_s = (
+            max(analysis.status_interval_s, analysis.metrics_interval_s) + SCRAPE_TIMEOUT_S + 5
+        )
 
     def __enter__(self) -> "TelemetrySession":
-        for collector in self.collectors:
-            collector.start()
+        started = []
+        try:
+            for collector in self.collectors:
+                collector.start()
+                started.append(collector)
+        except BaseException:
+            for collector in started:
+                collector.stop(self._stop_timeout_s)
+            raise
         return self
 
     def __exit__(self, *exc: Any) -> None:

@@ -49,7 +49,8 @@ def _title(experiment: dict[str, Any]) -> str:
         f"(initial {experiment['initial_replicas']}) · "
         f"target_ongoing_requests={experiment['target_ongoing_requests']:g} · "
         f"window {experiment['window_s']:g}s · "
-        f"telemetry every {experiment['telemetry_interval_s']:g}s"
+        f"status every {experiment['status_interval_s']:g}s · "
+        f"metrics every {experiment['metrics_interval_s']:g}s"
     )
 
 
@@ -76,6 +77,9 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
                            ("successful_completed_rps", "completed (ok)", 1.5)):
         if windows:
             traffic.stairs([w[key] for w in windows], edges, label=label, lw=lw)
+    if any(w["failed_completed_rps"] for w in windows):
+        traffic.stairs([w["failed_completed_rps"] for w in windows], edges,
+                       label="completed (failed)", lw=1.5, color="red")
     traffic.set_ylabel("requests / s")
     traffic.set_title("Traffic", loc="left", fontsize=10)
 
@@ -119,21 +123,27 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
     pressure.set_title("Pressure", loc="left", fontsize=10)
 
     # Panel 4: autoscaling, as step functions at the original sample times.
-    for key, label, style in (("target_replicas", "target (status)", {"lw": 2.5}),
-                              ("running_replicas", "running", {"lw": 1.5}),
-                              ("starting_replicas", "starting", {"lw": 1.5})):
-        xs, ys = primary_points(status, key, step=True)
-        if xs:
-            replicas.step(xs, ys, where="post", label=label, **style)
-    for key, label in (("desired_replicas", "desired (metric)"),
-                       ("target_replicas", "target (metric)")):
+    # Unavailable status samples have no counts and break the line.
+    observed = [experiment["max_replicas"], 1]
+    for key, label, style in (("target_replicas", "target", {"lw": 2.5}),
+                              ("desired_replicas", "desired", {"lw": 1, "ls": "--"})):
         if key in metrics:
             xs, ys = primary_points(metrics[key]["points"], "value", step=True)
-            replicas.step(xs, ys, where="post", ls="--", lw=1, label=label)
+            replicas.step(xs, ys, where="post", label=label, **style)
+            observed += ys
+    for key, label in (("running_replicas", "running"), ("starting_replicas", "starting"),
+                       ("stopping_replicas", "stopping")):
+        xs, ys = primary_points(
+            [s if s.get("error") is None else {**s, key: math.nan} for s in status],
+            key, step=True,
+        )
+        if any(not math.isnan(y) for y in ys):
+            replicas.step(xs, ys, where="post", label=label, lw=1.5)
+            observed += [y for y in ys if not math.isnan(y)]
     if not replicas.lines:
         replicas.text(0.5, 0.5, "no replica telemetry", transform=replicas.transAxes,
                       ha="center", va="center", color="gray")
-    replicas.set_ylim(bottom=0, top=max(experiment["max_replicas"], 1) + 0.5)
+    replicas.set_ylim(bottom=0, top=max(observed) + 0.5)
     replicas.yaxis.get_major_locator().set_params(integer=True)
     replicas.set_ylabel("replicas")
     replicas.set_xlabel("seconds since profiling start")

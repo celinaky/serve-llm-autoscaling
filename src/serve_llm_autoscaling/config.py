@@ -182,7 +182,8 @@ class AnalysisConfig(BaseModel):
     window_s: float = Field(default=5, gt=0)
     # Rolling window for tail latency; smooths p99 over sparse request windows.
     tail_window_s: float = Field(default=30, gt=0)
-    telemetry_interval_s: float = Field(default=1, gt=0)
+    status_interval_s: float = Field(default=1, gt=0)
+    metrics_interval_s: float = Field(default=2, gt=0)
     prometheus_enabled: bool = True
     generate_plots: bool = True
     ttft_slo_ms: float | None = Field(default=None, gt=0)

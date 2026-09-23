@@ -103,9 +103,21 @@ def test_in_flight_at_boundary(tmp_path: Path):
     result = request_timeseries(_write(tmp_path, [
         _record(1, 6), _record(2, 5), _record(4, 4.5), _record(6, 7),
     ]))
-    # Started before 5s and not ended before 5s: the 1->6 and 2->5 requests.
-    assert result["windows"][0]["in_flight_at_end"] == 2
-    assert result["windows"][1]["in_flight_at_end"] == 0
+    # Started before 5s and not ended by it: only 1->6; 2->5 completed at 5s.
+    first, second = result["windows"]
+    assert first["in_flight_at_end"] == 1
+    assert second["in_flight_at_end"] == 0
+    # Completions fall in (start, end]: 2->5 completes in the first window.
+    assert (first["successful_completions"], second["successful_completions"]) == (2, 2)
+
+
+def test_rejects_out_of_order_and_nonfinite_records(tmp_path: Path):
+    result = request_timeseries(_write(tmp_path, [
+        _record(1, 2), _record(3, 2), _record(2, 4, start=1),
+        _record(1, 2, ttft=float("inf")), _record(1, 2, ttft=float("nan")),
+    ]))
+    assert result["malformed_record_count"] == 4
+    assert result["windows"][0]["ttft_sample_count"] == 1
 
 
 def test_empty_windows(tmp_path: Path):

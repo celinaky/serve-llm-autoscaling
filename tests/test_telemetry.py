@@ -9,6 +9,7 @@ from serve_llm_autoscaling.config import load_config
 from serve_llm_autoscaling.telemetry import (
     TelemetrySession,
     discover_endpoints,
+    fetch_serve_status,
     parse_metrics,
     prometheus_collector,
     serve_status_collector,
@@ -19,20 +20,13 @@ APP = "ttft-benchmark"
 LLM = "LLMServer:Qwen--Qwen3-0_6B-FP8"
 
 
-def _replica(replica_id, state, node="node-1"):
-    return {"replica_id": replica_id, "state": state, "node_id": node,
-            "actor_id": f"actor-{replica_id}", "pid": 1, "start_time_s": 0.0}
-
-
-def serve_details(target=3, replicas=(("r1", "RUNNING"), ("r2", "STARTING")), dead=("r0",)):
+def serve_status(states=None):
     return {"applications": {APP: {
         "status": "RUNNING",
         "deployments": {LLM: {
             "status": "UPSCALING",
             "status_trigger": "AUTOSCALING",
-            "target_num_replicas": target,
-            "replicas": [_replica(r, s) for r, s in replicas],
-            "recent_dead_replicas": [_replica(r, "STOPPED") for r in dead],
+            "replica_states": {"RUNNING": 1, "STARTING": 1} if states is None else states,
         }},
     }}}
 
@@ -56,17 +50,14 @@ def _wait_for_records(collector, count, timeout=5):
     collector.stop(timeout)
 
 
-def test_status_sample_counts_live_replicas():
-    sample = serve_status_sample(serve_details(), APP, 123)
-    deployment = sample["deployments"][LLM]
+def test_status_sample_records_replica_states():
+    sample = serve_status_sample(serve_status(), APP, 123)
     assert sample["timestamp_ns"] == 123 and sample["error"] is None
+    assert sample["available"] is True
     assert sample["application_status"] == "RUNNING"
-    assert deployment["target_num_replicas"] == 3
-    assert deployment["live_replicas"] == 2  # r0 is a recent dead replica
-    assert deployment["replicas_by_state"] == {"RUNNING": 1, "STARTING": 1}
-    assert [r["replica_id"] for r in deployment["replicas"]] == ["r1", "r2"]
-    assert deployment["replicas"][0] == {
-        "replica_id": "r1", "state": "RUNNING", "node_id": "node-1", "actor_id": "actor-r1"
+    assert sample["deployments"][LLM] == {
+        "status": "UPSCALING", "status_trigger": "AUTOSCALING",
+        "replica_states": {"RUNNING": 1, "STARTING": 1},
     }
 
 
@@ -74,18 +65,38 @@ def test_status_sample_records_enum_values():
     class State(str, Enum):
         RUNNING = "RUNNING"
 
-    details = serve_details()
-    deployment = details["applications"][APP]["deployments"][LLM]
-    deployment["status"] = State.RUNNING
-    deployment["replicas"][0]["state"] = State.RUNNING
-    deployment = serve_status_sample(details, APP, 1)["deployments"][LLM]
+    status = serve_status(states={State.RUNNING: 2})
+    status["applications"][APP]["deployments"][LLM]["status"] = State.RUNNING
+    deployment = serve_status_sample(status, APP, 1)["deployments"][LLM]
     assert type(deployment["status"]) is str
-    assert [type(k) for k in deployment["replicas_by_state"]] == [str, str]
+    assert [type(k) for k in deployment["replica_states"]] == [str]
 
 
-def test_status_sample_missing_application():
+def test_status_sample_missing_application_is_unavailable():
     sample = serve_status_sample({"applications": {}}, APP, 1)
-    assert sample["application_status"] is None and sample["deployments"] == {}
+    assert sample["available"] is False
+    assert sample["error"] == "configured application not present"
+    assert sample["deployments"] == {}
+
+
+def test_fetch_serve_status_uses_public_api(monkeypatch):
+    from ray import serve
+    from ray.serve._private.common import ReplicaState
+    from ray.serve.schema import (
+        ApplicationStatusOverview, DeploymentStatusOverview, ServeStatus,
+    )
+
+    status = ServeStatus(applications={APP: ApplicationStatusOverview(
+        status="RUNNING", message="", last_deployed_time_s=0,
+        deployments={LLM: DeploymentStatusOverview(
+            status="HEALTHY", status_trigger="AUTOSCALING", message="",
+            replica_states={ReplicaState.RUNNING: 2, ReplicaState.STARTING: 1},
+        )},
+    )})
+    monkeypatch.setattr(serve, "status", lambda: status)
+    sample = serve_status_sample(fetch_serve_status(), APP, 1)
+    assert json.loads(json.dumps(sample)) == sample
+    assert sample["deployments"][LLM]["replica_states"] == {"RUNNING": 2, "STARTING": 1}
 
 
 def test_status_collector_recovers_after_error(tmp_path: Path):
@@ -95,7 +106,7 @@ def test_status_collector_recovers_after_error(tmp_path: Path):
         calls.append(1)
         if len(calls) == 1:
             raise ConnectionError("controller unavailable")
-        return serve_details()
+        return serve_status()
 
     path = tmp_path / "serve_status.jsonl"
     _wait_for_records(serve_status_collector(path, APP, 0.01, fetch), 2)
@@ -103,14 +114,14 @@ def test_status_collector_recovers_after_error(tmp_path: Path):
     assert first["error"] == "ConnectionError: controller unavailable"
     assert first["deployments"] == {} and first["timestamp_ns"] > 0
     assert second["error"] is None
-    assert second["deployments"][LLM]["live_replicas"] == 2
+    assert second["deployments"][LLM]["replica_states"] == {"RUNNING": 1, "STARTING": 1}
 
 
 def _session(tmp_path, **overrides):
     config = load_config("experiments/step_rate_autoscaling.yaml")
-    config.analysis.telemetry_interval_s = 0.01
+    config.analysis.status_interval_s = config.analysis.metrics_interval_s = 0.01
     kwargs = {
-        "status_fetch": serve_details,
+        "status_fetch": serve_status,
         "discover": lambda: [{"NodeID": "n1", "NodeManagerAddress": "10.0.0.1",
                               "MetricsExportPort": 8085, "Alive": True}],
         "fetch_metrics": lambda url: "ray_serve_replica_processing_queries 1\n",
@@ -126,6 +137,7 @@ def test_session_stops_and_flushes_after_exception(tmp_path: Path):
             raise RuntimeError("aiperf failed")
     assert all(not c._thread.is_alive() for c in session.collectors)
     assert all(c._fh.closed for c in session.collectors)
+    assert session.collectors[1]._sample._pool._shutdown  # scrape threads released
     status = _read(tmp_path / "telemetry" / "serve_status.jsonl")
     metrics = _read(tmp_path / "telemetry" / "serve_metrics.jsonl")
     assert len(status) == session.summary()["serve_status.jsonl"]["records"] > 0
@@ -135,8 +147,21 @@ def test_session_stops_and_flushes_after_exception(tmp_path: Path):
 def test_session_without_prometheus(tmp_path: Path):
     config = load_config("experiments/step_rate_autoscaling.yaml")
     config.analysis.prometheus_enabled = False
-    session = TelemetrySession(config, tmp_path, status_fetch=serve_details)
+    session = TelemetrySession(config, tmp_path, status_fetch=serve_status)
     assert [Path(c.path).name for c in session.collectors] == ["serve_status.jsonl"]
+
+
+def test_session_stops_started_collectors_when_a_start_fails(tmp_path: Path, monkeypatch):
+    session = _session(tmp_path)
+    status, metrics = session.collectors
+
+    def fail():
+        raise OSError("disk full")
+
+    monkeypatch.setattr(metrics, "start", fail)
+    with pytest.raises(OSError, match="disk full"):
+        session.__enter__()
+    assert not status._thread.is_alive() and status._fh.closed
 
 
 def test_discover_endpoints():
@@ -208,10 +233,14 @@ def test_prometheus_collector_records_node_failure(tmp_path: Path):
     assert by_node["bad"]["error"] == "TimeoutError: scrape timed out"
     assert by_node["bad"]["samples"] == []
     assert by_node["good"]["error"] is None
-    assert by_node["good"]["endpoint"] == "http://10.0.0.1:1/metrics"
-    assert len(by_node["good"]["samples"]) == 2
-    assert "available_serve_metrics" in by_node["good"]
-    # The family list is only repeated when it changes.
+    good = by_node["good"]
+    assert good["endpoint"] == "http://10.0.0.1:1/metrics"
+    assert len(good["samples"]) == 2
+    assert "available_serve_metrics" in good
+    # Samples are aligned on scrape completion; the start bounds the uncertainty.
+    assert good["scrape_started_at_ns"] <= good["scrape_finished_at_ns"] == good["timestamp_ns"]
+    assert good["bytes"] == len(EXPOSITION)
+    assert good["cycle_overran"] in (True, False) and good["cycle_duration_s"] >= 0
     later = [r for r in records[2:] if r["node_id"] == "good"]
     assert later and "available_serve_metrics" not in later[0]
     assert records[0]["tick"] == records[1]["tick"] == 0
@@ -226,3 +255,11 @@ def test_prometheus_collector_records_discovery_failure(tmp_path: Path):
     record = _read(path)[0]
     assert record["error"] == "RuntimeError: ray not connected"
     assert record["endpoint"] is None and record["samples"] == []
+
+
+def test_prometheus_collector_records_empty_discovery(tmp_path: Path):
+    path = tmp_path / "serve_metrics.jsonl"
+    _wait_for_records(prometheus_collector(path, 0.01, lambda: [], lambda url: ""), 2)
+    records = _read(path)
+    assert all(r["error"] == "RuntimeError: No live Ray metrics endpoints discovered"
+               for r in records)

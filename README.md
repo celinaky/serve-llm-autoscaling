@@ -127,16 +127,17 @@ The harness translates the YAML curve into the JSON format expected by AIPerf.
 ## Autoscaling telemetry and timeline
 
 While a request-rate series runs, two background collectors sample the cluster
-every `analysis.telemetry_interval_s` (default 1s), from immediately before
-AIPerf starts through its grace/drain period. They serve different purposes:
+from immediately before AIPerf starts through its grace/drain period:
 
-- **Serve status** records what the controller *decided* and what exists: each
-  deployment's target replica count and every live replica with its state
-  (`STARTING`, `RUNNING`, ...). Recently dead replicas are not counted.
-- **Prometheus metrics** record the *signals* the autoscaler and routers see:
-  ongoing requests at replicas, router queue lengths, desired/target replicas,
-  replica health and startup latency. The harness scrapes each Ray node's
-  metrics export port directly; no Prometheus server is required.
+- **Serve status** (public `serve.status()`, every `analysis.status_interval_s`,
+  default 1s) records realized capacity: replica counts by state (`STARTING`,
+  `RUNNING`, `STOPPING`, ...). A missing application is recorded as unavailable,
+  never as zero replicas.
+- **Prometheus metrics** (every `analysis.metrics_interval_s`, default 2s)
+  record what the autoscaler and routers see: desired/target replicas, ongoing
+  requests at replicas, router and handle queues, replica health and startup
+  latency. The harness scrapes each Ray node's metrics export port directly;
+  no Prometheus server is required.
 
 Both are stamped with the same epoch clock as AIPerf and aligned to AIPerf's
 profiling start. Collection failures are recorded as error samples and never
@@ -158,8 +159,8 @@ After the run, the harness derives the analysis from the raw artifacts:
   2. User experience: TTFT p50/p90/p99, rolling p99, optional SLO.
   3. Pressure: client in-flight requests and queue delay, Serve ongoing
      requests and router queue length.
-  4. Autoscaling: desired (when exported), target, starting and running
-     replicas as step functions.
+  4. Autoscaling: desired and target replicas (metrics) with running,
+     starting and stopping replicas (status) as step functions.
 
   Vertical lines mark the load curve's control points. Signals that were not
   collected are omitted with a warning rather than drawn as zero.

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -60,11 +60,17 @@ def _parse(line: str) -> _Request | None:
         return None
     if not all(isinstance(v, int) and not isinstance(v, bool) for v in (credit, start, end)):
         raise ValueError("timestamps must be integers")
+    if not credit <= start <= end:
+        raise ValueError("timestamps out of order")
     ttft = (record.get("metrics") or {}).get("time_to_first_token") or {}
     ttft_ms = ttft.get("value") if isinstance(ttft, dict) else None
+    if isinstance(ttft_ms, bool) or not isinstance(ttft_ms, (int, float)):
+        ttft_ms = None
+    elif not math.isfinite(ttft_ms):
+        raise ValueError("TTFT is not finite")
     return _Request(
         credit, start, end, record.get("error") is not None,
-        float(ttft_ms) if isinstance(ttft_ms, (int, float)) else None,
+        float(ttft_ms) if ttft_ms is not None else None,
     )
 
 
@@ -97,7 +103,10 @@ def request_timeseries(
 
     Offered load uses credit issue time, starts use request start, completions
     use request end, and TTFT belongs to the window in which the request
-    started. Windows continue until the last request finishes.
+    started. Credits and starts fall in ``[start, end)`` windows, completions in
+    ``(start, end]``, so a request ending exactly on a boundary completes in the
+    earlier window and is no longer in flight at that boundary. Windows continue
+    until the last request finishes.
     """
     requests, malformed = _read_requests(artifact_dir / "profile_export.jsonl")
     t0 = profiling_start_ns(artifact_dir)
@@ -114,8 +123,9 @@ def request_timeseries(
         horizon = max([duration_s or 0.0] + [rel(r.end_ns) for r in requests])
         count = math.ceil(horizon / window_s)
 
-    def index(ns: int) -> int | None:
-        i = math.floor(rel(ns) / window_s)
+    def index(ns: int, *, closed_right: bool = False) -> int | None:
+        position = rel(ns) / window_s
+        i = math.ceil(position) - 1 if closed_right else math.floor(position)
         return i if 0 <= i < count else None
 
     buckets = [
@@ -130,7 +140,7 @@ def request_timeseries(
             buckets[i]["queue"].append((r.start_ns - r.credit_ns) / 1e6)
             if not r.failed and r.ttft_ms is not None:
                 buckets[i]["ttft"].append(r.ttft_ms)
-        if (i := index(r.end_ns)) is not None:
+        if (i := index(r.end_ns, closed_right=True)) is not None:
             buckets[i]["failed" if r.failed else "ok"] += 1
 
     starts = sorted(r.start_ns for r in requests)
@@ -158,8 +168,8 @@ def request_timeseries(
             "started_rps": b["started"] / window_s,
             "successful_completed_rps": b["ok"] / window_s,
             "failed_completed_rps": b["failed"] / window_s,
-            # Started before the boundary and not ended before it.
-            "in_flight_at_end": bisect_left(starts, boundary) - bisect_left(ends, boundary),
+            # Started before the boundary and not ended by it.
+            "in_flight_at_end": bisect_left(starts, boundary) - bisect_right(ends, boundary),
             "ttft_sample_count": len(ttft),
             "p50_ttft_ms": percentile(ttft, 0.50),
             "p90_ttft_ms": percentile(ttft, 0.90),
