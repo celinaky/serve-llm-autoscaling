@@ -35,6 +35,114 @@ def write_json(path: Path, value: Any) -> None:
         fh.write("\n")
 
 
+def _read_json(path: Path) -> Any:
+    try:
+        with path.open() as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _fmt(value: Any, spec: str = ".1f", suffix: str = "") -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:{spec}}{suffix}"
+    return f"{value}{suffix}"
+
+
+def _duration(started: str | None, finished: str | None) -> str | None:
+    if not started or not finished:
+        return None
+    seconds = (
+        datetime.fromisoformat(finished) - datetime.fromisoformat(started)
+    ).total_seconds()
+    minutes, seconds = divmod(int(round(seconds)), 60)
+    return f"{minutes}m {seconds:02d}s" if minutes else f"{seconds}s"
+
+
+def _teardown_state(root: Path) -> str:
+    state = "not run"
+    try:
+        lines = (root / "deployment" / "events.jsonl").read_text().splitlines()
+    except OSError:
+        return state
+    for line in lines:
+        event = json.loads(line)
+        if event["event"] == "teardown_completed":
+            state = "completed"
+        elif event["event"] == "teardown_skipped":
+            state = "skipped (deployment kept running)"
+        elif event["event"] == "teardown_failed":
+            state = f"FAILED ({event.get('error')})"
+    return state
+
+
+def format_run_summary(root: Path) -> str:
+    """Render a human-readable summary of a run directory for the terminal."""
+    manifest = _read_json(root / "manifest.json") or {}
+    points = _read_json(root / "benchmark" / "sweep_summary.json") or []
+
+    failed_points = [p for p in points if p.get("error")]
+    failed_requests = sum(p.get("failed_requests") or 0 for p in points)
+    status = manifest.get("status")
+    if status == "succeeded" and not failed_points and not failed_requests:
+        verdict = "SUCCEEDED (no errors)"
+    elif status == "succeeded":
+        problems = []
+        if failed_points:
+            problems.append(f"{len(failed_points)} of {len(points)} points failed")
+        if failed_requests:
+            problems.append(f"{failed_requests} failed requests")
+        verdict = f"SUCCEEDED WITH ERRORS ({', '.join(problems)})"
+    elif status == "failed":
+        verdict = f"FAILED at stage '{manifest.get('failure_stage')}'"
+    else:
+        verdict = "INCOMPLETE (interrupted)"
+
+    duration = _duration(manifest.get("started_at"), manifest.get("finished_at"))
+    readiness = manifest.get("readiness_s")
+    timing = _fmt(duration)
+    if readiness is not None:
+        timing += f" (deployment ready after {readiness:.1f}s)"
+
+    lines = [
+        "",
+        f"=== Run summary: {manifest.get('name', root.name)} ===",
+        f"Status:    {verdict}",
+    ]
+    if manifest.get("error"):
+        lines.append(f"Error:     {manifest['error']}")
+    lines += [
+        f"Duration:  {timing}",
+        f"Teardown:  {_teardown_state(root)}",
+        f"Artifacts: {root}",
+    ]
+
+    if points:
+        header = (
+            f"{'mode':<12}{'level':>7}{'requests':>10}{'failed':>8}{'req/s':>8}"
+            f"{'TTFT p50':>11}{'TTFT p99':>11}{'TPOT p50':>11}{'E2E p99':>11}"
+        )
+        lines += ["", header]
+        for p in points:
+            if p.get("error"):
+                lines.append(
+                    f"{p.get('mode', ''):<12}{_fmt(p.get('level')):>7}  ERROR: {p['error']}"
+                )
+                continue
+            lines.append(
+                f"{p.get('mode', ''):<12}{_fmt(p.get('level')):>7}"
+                f"{_fmt(p.get('request_count'), '.0f'):>10}{_fmt(p.get('failed_requests'), '.0f'):>8}"
+                f"{_fmt(p.get('request_throughput'), '.2f'):>8}"
+                f"{_fmt(p.get('p50_ttft_ms'), '.1f', 'ms'):>11}"
+                f"{_fmt(p.get('p99_ttft_ms'), '.1f', 'ms'):>11}"
+                f"{_fmt(p.get('p50_tpot_ms'), '.2f', 'ms'):>11}"
+                f"{_fmt(p.get('p99_e2el_ms'), '.1f', 'ms'):>11}"
+            )
+    return "\n".join(lines) + "\n"
+
+
 @dataclass
 class RunArtifacts:
     root: Path

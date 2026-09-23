@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .artifacts import RunArtifacts, write_json
+from .artifacts import RunArtifacts, format_run_summary, write_json
 from .backend import RayServeBackend
 from .benchmark import AIPerfRunner, aiperf_command
 from .config import ExperimentConfig
@@ -118,3 +118,6 @@ def run_experiment(
                 artifacts.record_event(
                     "teardown_failed", error=f"{type(exc).__name__}: {exc}"
                 )
+        elif deployed:
+            artifacts.record_event("teardown_skipped")
+        print(format_run_summary(artifacts.root), flush=True)
