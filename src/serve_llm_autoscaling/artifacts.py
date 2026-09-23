@@ -121,18 +121,18 @@ def format_run_summary(root: Path) -> str:
 
     if points:
         header = (
-            f"{'mode':<12}{'level':>7}{'requests':>10}{'failed':>8}{'req/s':>8}"
+            f"{'mode':<20}{'level':>7}{'requests':>10}{'failed':>8}{'req/s':>8}"
             f"{'TTFT p50':>11}{'TTFT p99':>11}{'TPOT p50':>11}{'E2E p99':>11}"
         )
         lines += ["", header]
         for p in points:
             if p.get("error"):
                 lines.append(
-                    f"{p.get('mode', ''):<12}{_fmt(p.get('level')):>7}  ERROR: {p['error']}"
+                    f"{p.get('mode', ''):<20}{_fmt(p.get('level')):>7}  ERROR: {p['error']}"
                 )
                 continue
             lines.append(
-                f"{p.get('mode', ''):<12}{_fmt(p.get('level')):>7}"
+                f"{p.get('mode', ''):<20}{_fmt(p.get('level')):>7}"
                 f"{_fmt(p.get('request_count'), '.0f'):>10}{_fmt(p.get('failed_requests'), '.0f'):>8}"
                 f"{_fmt(p.get('request_throughput'), '.2f'):>8}"
                 f"{_fmt(p.get('p50_ttft_ms'), '.1f', 'ms'):>11}"

@@ -11,7 +11,8 @@ from typing import Any
 
 from .config import ExperimentConfig
 
-AIPERF_COMMAND = ["uvx", "--from", "aiperf==0.11.0", "aiperf"]
+# AIPerf 0.12 needs Python 3.11+, which the Ray image's driver may not have.
+AIPERF_COMMAND = ["uvx", "--python", "3.11", "--from", "aiperf==0.12.0", "aiperf"]
 
 
 def aiperf_command() -> list[str]:
@@ -58,7 +59,7 @@ class AIPerfRunner:
     config: ExperimentConfig
     benchmark_root: Path
 
-    def build_command(self, level: float, artifact_dir: Path) -> list[str]:
+    def _base_command(self, artifact_dir: Path) -> list[str]:
         benchmark = self.config.benchmark
         workload = benchmark.workload
         deployment = self.config.deployment
@@ -88,17 +89,39 @@ class AIPerfRunner:
             cmd.extend(["--extra-inputs", "ignore_eos:true"])
         if benchmark.warmup.enabled:
             cmd.extend(["--warmup-duration", str(benchmark.warmup.duration_s)])
+        return cmd
+
+    def _arrival_args(self) -> list[str]:
+        benchmark = self.config.benchmark
+        args = ["--arrival-pattern", benchmark.arrival_pattern]
+        if benchmark.arrival_smoothness is not None:
+            args.extend(["--arrival-smoothness", str(benchmark.arrival_smoothness)])
+        return args
+
+    def build_command(self, level: float, artifact_dir: Path) -> list[str]:
+        benchmark = self.config.benchmark
+        cmd = self._base_command(artifact_dir)
         if benchmark.mode == "concurrency":
             cmd.extend(["--concurrency", str(int(level))])
         else:
-            cmd.extend(
-                [
-                    "--request-rate", str(level),
-                    "--arrival-pattern", benchmark.arrival_pattern,
-                ]
-            )
+            cmd.extend(["--request-rate", str(level), *self._arrival_args()])
         cmd.extend(benchmark.extra_args)
         return cmd
+
+    def build_series_command(self, series_path: Path, artifact_dir: Path) -> list[str]:
+        cmd = self._base_command(artifact_dir)
+        # AIPerf refuses series paths with symlinked components; resolve them.
+        cmd.extend(
+            ["--request-rate-series", str(series_path.resolve()), *self._arrival_args()]
+        )
+        cmd.extend(self.config.benchmark.extra_args)
+        return cmd
+
+    def write_rate_series(self, path: Path) -> None:
+        points = self.config.benchmark.rate_series or []
+        with path.open("w") as fh:
+            json.dump({"points": [point.model_dump() for point in points]}, fh, indent=2)
+            fh.write("\n")
 
     def run_point(self, level: float) -> dict[str, Any]:
         mode = self.config.benchmark.mode
@@ -110,6 +133,19 @@ class AIPerfRunner:
         point_dir = self.benchmark_root / f"{mode}-{label_value}"
         point_dir.mkdir(parents=True, exist_ok=False)
         cmd = self.build_command(level, point_dir)
+        return self._execute(
+            cmd, point_dir, int(level) if float(level).is_integer() else level
+        )
+
+    def run_series(self) -> dict[str, Any]:
+        series_dir = self.benchmark_root / "request-rate-series"
+        series_dir.mkdir(parents=True, exist_ok=False)
+        series_path = series_dir / "rate_series.json"
+        self.write_rate_series(series_path)
+        cmd = self.build_series_command(series_path, series_dir)
+        return self._execute(cmd, series_dir, "series")
+
+    def _execute(self, cmd: list[str], point_dir: Path, level: Any) -> dict[str, Any]:
         with (point_dir / "command.json").open("w") as fh:
             json.dump({"argv": cmd, "display": shlex.join(cmd)}, fh, indent=2)
             fh.write("\n")
@@ -139,8 +175,8 @@ class AIPerfRunner:
         normalized = normalize_aiperf(raw)
         normalized.update(
             {
-                "mode": mode,
-                "level": int(level) if float(level).is_integer() else level,
+                "mode": self.config.benchmark.mode,
+                "level": level,
                 "elapsed_s": elapsed,
                 "artifact_dir": str(point_dir),
                 "error": None,

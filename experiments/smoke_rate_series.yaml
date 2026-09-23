@@ -1,0 +1,38 @@
+name: qwen-smoke-rate-series
+
+deployment:
+  model_id: Qwen/Qwen3-0.6B-FP8
+  engine:
+    max_model_len: 2048
+  autoscaling:
+    min_replicas: 1
+    initial_replicas: 1
+    max_replicas: 1
+
+benchmark:
+  mode: request_rate_series
+  duration_s: 30
+  grace_period_s: 10
+  arrival_pattern: poisson
+  rate_series:
+    - time_s: 0
+      qps: 1
+    - time_s: 10
+      qps: 1
+    - time_s: 10.1
+      qps: 2
+    - time_s: 20
+      qps: 2
+    - time_s: 20.1
+      qps: 1
+    - time_s: 30
+      qps: 1
+  warmup:
+    enabled: false
+  workload:
+    input_tokens: 256
+    output_tokens: 32
+  fail_fast: true
+
+runtime:
+  readiness_timeout_s: 600

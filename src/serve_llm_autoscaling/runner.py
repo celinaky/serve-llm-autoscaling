@@ -4,8 +4,9 @@ import platform
 import subprocess
 import sys
 import time
+from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .artifacts import RunArtifacts, format_run_summary, write_json
 from .backend import RayServeBackend
@@ -45,13 +46,25 @@ def environment_check(connect: bool = True) -> dict[str, Any]:
 def run_benchmarks(config: ExperimentConfig, root: Path) -> list[dict[str, Any]]:
     runner = AIPerfRunner(config, root / "benchmark")
     summary: list[dict[str, Any]] = []
-    for level in config.benchmark.levels:
+    jobs: list[tuple[Any, Callable[[], dict[str, Any]]]]
+    if config.benchmark.mode == "request_rate_series":
+        # A series is one continuous AIPerf process, summarized as a single row.
+        jobs = [("series", runner.run_series)]
+    else:
+        jobs = [
+            (
+                int(level) if float(level).is_integer() else level,
+                partial(runner.run_point, level),
+            )
+            for level in config.benchmark.levels
+        ]
+    for level, job in jobs:
         try:
-            row = runner.run_point(level)
+            row = job()
         except Exception as exc:
             row = {
                 "mode": config.benchmark.mode,
-                "level": int(level) if float(level).is_integer() else level,
+                "level": level,
                 "error": f"{type(exc).__name__}: {exc}",
             }
             summary.append(row)

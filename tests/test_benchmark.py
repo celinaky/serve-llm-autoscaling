@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from serve_llm_autoscaling import benchmark
 from serve_llm_autoscaling.benchmark import AIPerfRunner, normalize_aiperf
 from serve_llm_autoscaling.config import load_config
@@ -11,7 +13,9 @@ def test_build_concurrency_command(monkeypatch, tmp_path: Path):
     runner = AIPerfRunner(config, tmp_path)
     monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
     command = runner.build_command(4.0, tmp_path / "point")
-    assert command[:5] == ["uvx", "--from", "aiperf==0.11.0", "aiperf", "profile"]
+    assert command[:7] == [
+        "uvx", "--python", "3.11", "--from", "aiperf==0.12.0", "aiperf", "profile"
+    ]
     assert command[command.index("--concurrency") + 1] == "4"
     assert command[command.index("--isl") + 1] == "8000"
     assert command[command.index("--osl") + 1] == "50"
@@ -27,6 +31,101 @@ def test_build_request_rate_command(monkeypatch, tmp_path: Path):
     assert command[command.index("--request-rate") + 1] == "2.5"
     assert command[command.index("--arrival-pattern") + 1] == "poisson"
     assert "--concurrency" not in command
+
+
+def _series_config():
+    config = load_config("experiments/smoke_rate_series.yaml")
+    config.benchmark.extra_args = []
+    return config
+
+
+def test_write_rate_series(tmp_path: Path):
+    runner = AIPerfRunner(_series_config(), tmp_path)
+    path = tmp_path / "rate_series.json"
+    runner.write_rate_series(path)
+    assert json.loads(path.read_text()) == {
+        "points": [
+            {"time_s": 0.0, "qps": 1.0},
+            {"time_s": 10.0, "qps": 1.0},
+            {"time_s": 10.1, "qps": 2.0},
+            {"time_s": 20.0, "qps": 2.0},
+            {"time_s": 20.1, "qps": 1.0},
+            {"time_s": 30.0, "qps": 1.0},
+        ]
+    }
+
+
+def test_build_series_command(monkeypatch, tmp_path: Path):
+    runner = AIPerfRunner(_series_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    series_path = tmp_path / "rate_series.json"
+    command = runner.build_series_command(series_path, tmp_path)
+    assert command[command.index("--request-rate-series") + 1] == str(
+        series_path.resolve()
+    )
+    assert command[command.index("--arrival-pattern") + 1] == "poisson"
+    assert command[command.index("--benchmark-duration") + 1] == "30.0"
+    assert "--arrival-smoothness" not in command
+    assert "--request-rate" not in command
+    assert "--concurrency" not in command
+
+
+def test_build_series_command_gamma(monkeypatch, tmp_path: Path):
+    config = _series_config()
+    config.benchmark.arrival_pattern = "gamma"
+    config.benchmark.arrival_smoothness = 0.5
+    runner = AIPerfRunner(config, tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    command = runner.build_series_command(tmp_path / "rate_series.json", tmp_path)
+    assert command[command.index("--arrival-pattern") + 1] == "gamma"
+    assert command[command.index("--arrival-smoothness") + 1] == "0.5"
+
+
+def test_run_series(monkeypatch, tmp_path: Path):
+    runner = AIPerfRunner(_series_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        artifact_dir = Path(cmd[cmd.index("--artifact-dir") + 1])
+        series = json.loads(
+            Path(cmd[cmd.index("--request-rate-series") + 1]).read_text()
+        )
+        assert len(series["points"]) == 6
+        (artifact_dir / "profile_export_aiperf.json").write_text(
+            json.dumps({"request_count": {"avg": 40}})
+        )
+        (artifact_dir / "profile_export.jsonl").write_text("{}\n")
+        return benchmark.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+    row = runner.run_series()
+    series_dir = tmp_path / "request-rate-series"
+    assert len(calls) == 1
+    assert row["mode"] == "request_rate_series"
+    assert row["level"] == "series"
+    assert row["request_count"] == 40
+    assert row["error"] is None
+    assert row["artifact_dir"] == str(series_dir)
+    for name in ["rate_series.json", "command.json", "stdout.log", "stderr.log",
+                 "profile_export.jsonl"]:
+        assert (series_dir / name).exists()
+    assert "--request-rate-series" in json.loads(
+        (series_dir / "command.json").read_text()
+    )["argv"]
+
+
+def test_run_series_failure_points_to_stderr(monkeypatch, tmp_path: Path):
+    runner = AIPerfRunner(_series_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        benchmark.subprocess,
+        "run",
+        lambda cmd, **kwargs: benchmark.subprocess.CompletedProcess(cmd, 2),
+    )
+    with pytest.raises(RuntimeError, match="request-rate-series/stderr.log"):
+        runner.run_series()
 
 
 def test_normalize_aiperf():

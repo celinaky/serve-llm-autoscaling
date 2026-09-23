@@ -85,9 +85,17 @@ class WorkloadConfig(BaseModel):
     ignore_eos: bool = True
 
 
+class RequestRatePoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    time_s: float = Field(ge=0)
+    qps: float = Field(gt=0)
+
+
 class BenchmarkConfig(BaseModel):
     generator: Literal["aiperf"] = "aiperf"
-    mode: Literal["concurrency", "request_rate"] = "concurrency"
+    mode: Literal["concurrency", "request_rate", "request_rate_series"] = "concurrency"
+    # Only used by the static sweep modes; ignored for request_rate_series.
     levels: list[float] = Field(default_factory=lambda: [1, 2, 4, 8], min_length=1)
     duration_s: float = Field(default=120, gt=0)
     grace_period_s: float = Field(default=30, ge=0)
@@ -95,12 +103,61 @@ class BenchmarkConfig(BaseModel):
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
     streaming: bool = True
     arrival_pattern: Literal["constant", "poisson", "gamma"] = "poisson"
+    arrival_smoothness: float | None = Field(default=None, gt=0)
+    # AIPerf interpolates linearly between points, so a step needs two points
+    # close together (e.g. 60 -> 60.1).
+    rate_series: list[RequestRatePoint] | None = None
     fail_fast: bool = False
     use_server_token_count: bool = True
     extra_args: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_levels(self) -> "BenchmarkConfig":
+        if self.mode == "request_rate_series":
+            self._validate_rate_series()
+        else:
+            if self.rate_series is not None:
+                raise ValueError("rate_series requires mode: request_rate_series")
+            self._validate_static_levels()
+        if self.arrival_smoothness is not None and (
+            self.arrival_pattern != "gamma" or self.mode == "concurrency"
+        ):
+            raise ValueError(
+                "arrival_smoothness requires arrival_pattern: gamma in a "
+                "request-rate mode"
+            )
+        owned = {
+            "--model", "--model-names", "--tokenizer", "--url", "--streaming",
+            "--isl", "--osl", "--random-seed", "--benchmark-duration",
+            "--artifact-dir", "--output-artifact-dir", "--concurrency",
+            "--request-rate", "--arrival-pattern", "--warmup-duration",
+            "--request-rate-series", "--arrival-smoothness",
+        }
+        conflicts = sorted(set(self.extra_args) & owned)
+        if conflicts:
+            raise ValueError(
+                "extra_args cannot override harness-owned options: "
+                + ", ".join(conflicts)
+            )
+        return self
+
+    def _validate_rate_series(self) -> None:
+        points = self.rate_series
+        if not points:
+            raise ValueError("request_rate_series mode requires rate_series")
+        if len(points) < 2:
+            raise ValueError("rate_series requires at least two points")
+        if points[0].time_s != 0:
+            raise ValueError("rate_series must start at time_s 0")
+        times = [point.time_s for point in points]
+        if any(later <= earlier for earlier, later in zip(times, times[1:])):
+            raise ValueError("rate_series time_s values must be strictly increasing")
+        if times[-1] > self.duration_s:
+            raise ValueError(
+                f"rate_series ends at {times[-1]}s, after duration_s {self.duration_s}"
+            )
+
+    def _validate_static_levels(self) -> None:
         if any(level <= 0 for level in self.levels):
             raise ValueError("benchmark levels must all be positive")
         if len(set(self.levels)) != len(self.levels):
@@ -111,19 +168,6 @@ class BenchmarkConfig(BaseModel):
             not float(level).is_integer() for level in self.levels
         ):
             raise ValueError("concurrency levels must be integers")
-        owned = {
-            "--model", "--model-names", "--tokenizer", "--url", "--streaming",
-            "--isl", "--osl", "--random-seed", "--benchmark-duration",
-            "--artifact-dir", "--output-artifact-dir", "--concurrency",
-            "--request-rate", "--arrival-pattern", "--warmup-duration",
-        }
-        conflicts = sorted(set(self.extra_args) & owned)
-        if conflicts:
-            raise ValueError(
-                "extra_args cannot override harness-owned options: "
-                + ", ".join(conflicts)
-            )
-        return self
 
 
 class RuntimeConfig(BaseModel):
