@@ -3,20 +3,27 @@
 An experiment harness for benchmarking Ray Serve LLM deployments and
 autoscaling policies in a dedicated Anyscale workspace.
 
-## MVP workflow
+## Workflow
 
-The initial harness deploys a controlled Ray Serve LLM application, waits for
-its OpenAI-compatible endpoint, runs a fixed concurrency or request-rate sweep, or one continuous run along a request-rate curve with AIPerf, saves all
-artifacts, and tears Serve down.
+The harness deploys a controlled Ray Serve LLM application, waits for its
+OpenAI-compatible endpoint, generates traffic with AIPerf, saves the results,
+and tears Serve down. It supports two kinds of load tests:
+
+- **Sweeps** run a separate benchmark at each configured concurrency or request
+  rate. Use these to characterize steady-state performance and locate the
+  system's capacity limit.
+- **Request-rate series** run one uninterrupted benchmark while the offered
+  request rate changes over time. Use these to study autoscaling, overload, and
+  recovery behavior.
 
 The checked-in baseline uses one real `Qwen/Qwen3-0.6B-FP8` replica and a
 synthetic prefill-heavy workload (8,000 input tokens and 50 output tokens).
 
 ## Setup in an Anyscale workspace
 
-Run the harness on the Anyscale image's Python, so the
-Ray driver matches the workers. AIPerf runs through `uvx` in its own cached
-environment because its dependencies conflict with the image's.
+Run the harness on the Anyscale image's Python so the Ray driver matches the
+workers. AIPerf 0.12 runs through `uvx` with an isolated Python 3.11 environment
+because its dependencies and Python requirement may differ from the image's.
 
 ```bash
 pip install -e ".[dev]"
@@ -56,17 +63,22 @@ Keep the deployment alive for debugging:
 autoscale-harness run experiments/baseline.yaml --keep-deployment
 ```
 
-## Request-rate series
+## Run changing traffic over time
 
-`mode: request_rate_series` runs a single, continuous AIPerf process whose
-request rate follows a curve, instead of several independent benchmark points.
-The curve is a list of `(time_s, qps)` points; AIPerf interpolates linearly
-between them and holds the last rate afterwards. The first point must be at
-`time_s: 0`, times must be strictly increasing, and the last point must not
-exceed `duration_s`. `levels` is ignored in this mode.
+Set `benchmark.mode` to `request_rate_series` when the request rate needs to
+change during one experiment. Unlike a request-rate sweep, this starts only one
+AIPerf process, so requests and server state continue across every rate change.
 
-Because of the interpolation, approximate a step with two points 0.1s apart.
-This curve holds 8 req/s, steps to 18 req/s at 60s, and back to 8 at 180s:
+Describe the load curve with `rate_series`. Each point contains:
+
+- `time_s`: seconds from the start of AIPerf's measured profiling period
+- `qps`: the offered request rate at that time
+
+AIPerf linearly interpolates between consecutive points. A pair of points with
+the same QPS creates a plateau; two points close together create an approximate
+step. For example, this configuration sends 8 requests/second for 60 seconds,
+steps up to 18 requests/second, stays there until 180 seconds, and then returns
+to 8 requests/second for the remainder of the 300-second run:
 
 ```yaml
 benchmark:
@@ -82,17 +94,48 @@ benchmark:
     - {time_s: 300, qps: 8}
 ```
 
-A short 1 -> 2 -> 1 req/s smoke test and the full step experiment:
+The series must contain at least two points. The first must have `time_s: 0`,
+times must be strictly increasing, all QPS values must be positive, and the
+last point cannot be later than `duration_s`. The `levels` setting used by
+static sweeps is ignored in this mode.
+
+`arrival_pattern` controls how arrivals are distributed around the
+instantaneous QPS target:
+
+- `constant` spaces requests evenly and is useful for deterministic tests.
+- `poisson` introduces random variation and is the default.
+- `gamma` supports configurable burstiness through `arrival_smoothness`.
+
+Start with the short 1 -> 2 -> 1 requests/second smoke test:
 
 ```bash
 autoscale-harness run experiments/smoke_rate_series.yaml
+```
+
+Then run the full 8 -> 18 -> 8 requests/second experiment:
+
+```bash
 autoscale-harness run experiments/step_rate.yaml
 ```
 
-The run writes `benchmark/request-rate-series/` with the generated
-`rate_series.json`, the AIPerf command and logs, and AIPerf's native exports
-(including per-request records in `profile_export.jsonl`). `sweep_summary.json`
-holds a single row with `level: "series"` summarizing the whole run.
+The harness translates the YAML curve into the JSON format expected by AIPerf.
+The run directory contains:
+
+```text
+benchmark/
+├── request-rate-series/
+│   ├── rate_series.json          # curve passed to AIPerf
+│   ├── command.json              # exact command used
+│   ├── stdout.log
+│   ├── stderr.log
+│   ├── profile_export.jsonl      # per-request AIPerf records
+│   └── profile_export_aiperf.json
+└── sweep_summary.json            # aggregate metrics for the complete series
+```
+
+The summary contains one row with `mode: "request_rate_series"` and
+`level: "series"`. It summarizes the complete run; use the per-request JSONL
+export for analysis over time.
 
 ## Results
 
