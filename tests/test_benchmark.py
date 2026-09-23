@@ -114,8 +114,10 @@ def test_run_series(monkeypatch, tmp_path: Path):
     assert row["error"] is None
     assert row["artifact_dir"] == str(series_dir)
     for name in ["rate_series.json", "command.json", "stdout.log", "stderr.log",
-                 "profile_export.jsonl", "windows.json"]:
+                 "profile_export.jsonl"]:
         assert (series_dir / name).exists()
+    # Windowing is analysis, not part of running AIPerf.
+    assert not (series_dir / "windows.json").exists()
     assert "--request-rate-series" in json.loads(
         (series_dir / "command.json").read_text()
     )["argv"]

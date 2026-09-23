@@ -105,3 +105,101 @@ def test_static_mode_runs_each_level(monkeypatch, tmp_path: Path):
     summary = run_benchmarks(config, tmp_path)
     assert seen == config.benchmark.levels
     assert len(summary) == len(config.benchmark.levels)
+
+
+def _fake_cluster(monkeypatch, tmp_path: Path):
+    from serve_llm_autoscaling import runner
+    from serve_llm_autoscaling.telemetry import TelemetrySession
+
+    monkeypatch.setattr(runner, "environment_check", lambda connect: {})
+    for name, value in {"deploy": {}, "wait_healthy": {}, "teardown": None}.items():
+        monkeypatch.setattr(runner.RayServeBackend, name, lambda self, v=value: v)
+    sessions = []
+
+    def session(config, root):
+        sessions.append(TelemetrySession(
+            config, root, status_fetch=lambda: {"applications": {}},
+            discover=lambda: [], fetch_metrics=lambda url: "",
+        ))
+        return sessions[-1]
+
+    monkeypatch.setattr(runner, "TelemetrySession", session)
+    return sessions
+
+
+def test_series_experiment_collects_telemetry_and_analyzes(monkeypatch, tmp_path: Path):
+    from serve_llm_autoscaling.runner import run_experiment
+
+    sessions = _fake_cluster(monkeypatch, tmp_path)
+    config = load_config("experiments/smoke_rate_series.yaml")
+    config.runtime.results_dir = tmp_path / "runs"
+    order = []
+
+    def fake_series(self):
+        order.append([c._thread.is_alive() for c in sessions[0].collectors])
+        return {"mode": "request_rate_series", "level": "series", "error": None}
+
+    monkeypatch.setattr(
+        "serve_llm_autoscaling.runner.AIPerfRunner.run_series", fake_series
+    )
+    monkeypatch.setattr("serve_llm_autoscaling.runner.run_analysis",
+                        lambda root: {"warnings": ["w"], "plot_error": None})
+    root = run_experiment(config, Path("experiments/smoke_rate_series.yaml"))
+    assert order == [[True, True]]  # collectors ran during AIPerf
+    assert all(not c._thread.is_alive() for c in sessions[0].collectors)
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["status"] == "succeeded"
+    assert manifest["analysis"] == {"warnings": ["w"], "plot_error": None}
+    assert set(manifest["telemetry"]) == {"serve_status.jsonl", "serve_metrics.jsonl"}
+    assert (root / "telemetry" / "serve_status.jsonl").exists()
+
+
+def test_analysis_failure_does_not_fail_run(monkeypatch, tmp_path: Path):
+    from serve_llm_autoscaling.runner import run_experiment
+
+    _fake_cluster(monkeypatch, tmp_path)
+    config = load_config("experiments/smoke_rate_series.yaml")
+    config.runtime.results_dir = tmp_path / "runs"
+    monkeypatch.setattr(
+        "serve_llm_autoscaling.runner.AIPerfRunner.run_series",
+        lambda self: {"mode": "request_rate_series", "level": "series", "error": None},
+    )
+    # No AIPerf artifacts exist, so the real analysis fails.
+    root = run_experiment(config, Path("experiments/smoke_rate_series.yaml"))
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["status"] == "succeeded"
+    assert "analysis_error" in manifest["analysis"]
+
+
+def test_static_experiment_is_unchanged(monkeypatch, tmp_path: Path):
+    from serve_llm_autoscaling.runner import run_experiment
+
+    sessions = _fake_cluster(monkeypatch, tmp_path)
+    config = load_config("experiments/baseline.yaml")
+    config.runtime.results_dir = tmp_path / "runs"
+    monkeypatch.setattr("serve_llm_autoscaling.runner.AIPerfRunner.run_point",
+                        lambda self, level: {"level": level, "error": None})
+    root = run_experiment(config, Path("experiments/baseline.yaml"))
+    assert sessions == []
+    assert not (root / "telemetry").exists() and not (root / "analysis").exists()
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert "telemetry" not in manifest and "analysis" not in manifest
+
+
+def test_manual_series_benchmark_without_ray_warns(monkeypatch, tmp_path: Path, capsys):
+    from serve_llm_autoscaling import runner
+
+    def no_ray(self):
+        raise ConnectionError("no cluster")
+
+    monkeypatch.setattr(runner.RayServeBackend, "connect", no_ray)
+    monkeypatch.setattr(
+        "serve_llm_autoscaling.runner.AIPerfRunner.run_series",
+        lambda self: {"mode": "request_rate_series", "level": "series", "error": None},
+    )
+    config = load_config("experiments/smoke_rate_series.yaml")
+    runner.run_manual_benchmark(config, tmp_path)
+    err = capsys.readouterr().err
+    assert "running without Serve telemetry" in err
+    assert not (tmp_path / "telemetry").exists()
+    assert (tmp_path / "resolved.yaml").exists()

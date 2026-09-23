@@ -2,58 +2,190 @@ from __future__ import annotations
 
 import json
 import math
+from bisect import bisect_left
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
-WINDOW_S = 10
+SCHEMA_VERSION = 1
 
 
-def _percentile(values: list[float], pct: float) -> float | None:
-    if not values:
+class _Request(NamedTuple):
+    credit_ns: int
+    start_ns: int
+    end_ns: int
+    failed: bool
+    ttft_ms: float | None
+
+
+def percentile(ordered: list[float], q: float) -> float | None:
+    """Linear interpolation between closest ranks (NumPy's default method).
+
+    ``ordered`` must already be sorted; ``q`` is a fraction in [0, 1].
+    """
+    if not ordered:
         return None
-    ordered = sorted(values)
-    return ordered[min(len(ordered) - 1, int(len(ordered) * pct / 100))]
+    position = (len(ordered) - 1) * q
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def windowed_summary(artifact_dir: Path, duration_s: float) -> list[dict[str, Any]]:
-    """Summarize a series run's profiling records in windows of send time."""
-    with (artifact_dir / "profile_export.jsonl").open() as fh:
-        records = [json.loads(line) for line in fh if line.strip()]
-    records = [r for r in records if r["metadata"]["benchmark_phase"] == "profiling"]
-    # AIPerf only writes the phase manifest when the run has a warmup phase.
-    manifest = artifact_dir / "phase_manifest.json"
-    if manifest.exists():
-        t0 = next(
-            p["start_ns"] for p in json.loads(manifest.read_text())["phases"]
-            if p["phase_kind"] == "profiling"
+def profiling_start_ns(artifact_dir: Path) -> int | None:
+    """Profiling start from AIPerf's phase manifest, if it is usable."""
+    try:
+        manifest = json.loads((artifact_dir / "phase_manifest.json").read_text())
+        return next(
+            int(p["start_ns"]) for p in manifest["phases"]
+            if p.get("phase_kind") == "profiling"
         )
-    else:
-        t0 = min(r["metadata"]["credit_issued_ns"] for r in records)
-    rows = [
-        {
-            "sent": (r["metadata"]["credit_issued_ns"] - t0) / 1e9,
-            "end": (r["metadata"]["request_end_ns"] - t0) / 1e9,
-            "failed": r.get("error") is not None,
-            "ttft": r["metrics"].get("time_to_first_token", {}).get("value"),
-        }
-        for r in records
+    except (OSError, ValueError, KeyError, TypeError, StopIteration):
+        return None
+
+
+def _parse(line: str) -> _Request | None:
+    """Return one profiling request, or None if it belongs to another phase.
+
+    Raises ValueError for malformed records.
+    """
+    try:
+        record = json.loads(line)
+        meta = record["metadata"]
+        phase = meta["benchmark_phase"]
+        credit, start, end = (
+            meta["credit_issued_ns"], meta["request_start_ns"], meta["request_end_ns"]
+        )
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ValueError("malformed record") from exc
+    if phase != "profiling":
+        return None
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (credit, start, end)):
+        raise ValueError("timestamps must be integers")
+    ttft = (record.get("metrics") or {}).get("time_to_first_token") or {}
+    ttft_ms = ttft.get("value") if isinstance(ttft, dict) else None
+    return _Request(
+        credit, start, end, record.get("error") is not None,
+        float(ttft_ms) if isinstance(ttft_ms, (int, float)) else None,
+    )
+
+
+def _read_requests(path: Path) -> tuple[list[_Request], int]:
+    requests: list[_Request] = []
+    malformed = 0
+    with path.open() as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                request = _parse(line)
+            except ValueError:
+                malformed += 1
+                continue
+            if request is not None:
+                requests.append(request)
+    return requests, malformed
+
+
+def request_timeseries(
+    artifact_dir: Path,
+    *,
+    window_s: float = 5,
+    tail_window_s: float | None = None,
+    ttft_slo_ms: float | None = None,
+    duration_s: float | None = None,
+) -> dict[str, Any]:
+    """Summarize a series run's profiling records in fixed windows.
+
+    Offered load uses credit issue time, starts use request start, completions
+    use request end, and TTFT belongs to the window in which the request
+    started. Windows continue until the last request finishes.
+    """
+    requests, malformed = _read_requests(artifact_dir / "profile_export.jsonl")
+    t0 = profiling_start_ns(artifact_dir)
+    source = "phase_manifest"
+    if t0 is None:
+        source = "first_credit"
+        t0 = min((r.credit_ns for r in requests), default=None)
+
+    def rel(ns: int) -> float:
+        return (ns - t0) / 1e9
+
+    count = 0
+    if t0 is not None:
+        horizon = max([duration_s or 0.0] + [rel(r.end_ns) for r in requests])
+        count = math.ceil(horizon / window_s)
+
+    def index(ns: int) -> int | None:
+        i = math.floor(rel(ns) / window_s)
+        return i if 0 <= i < count else None
+
+    buckets = [
+        {"offered": 0, "started": 0, "ok": 0, "failed": 0, "ttft": [], "queue": []}
+        for _ in range(count)
     ]
-    # Run past duration_s until the last response so the queue drain shows.
-    horizon = max([duration_s] + [r["end"] for r in rows])
+    for r in requests:
+        if (i := index(r.credit_ns)) is not None:
+            buckets[i]["offered"] += 1
+        if (i := index(r.start_ns)) is not None:
+            buckets[i]["started"] += 1
+            buckets[i]["queue"].append((r.start_ns - r.credit_ns) / 1e6)
+            if not r.failed and r.ttft_ms is not None:
+                buckets[i]["ttft"].append(r.ttft_ms)
+        if (i := index(r.end_ns)) is not None:
+            buckets[i]["failed" if r.failed else "ok"] += 1
+
+    starts = sorted(r.start_ns for r in requests)
+    ends = sorted(r.end_ns for r in requests)
+    # (start time, TTFT) for the rolling tail, ordered by start.
+    ttft_by_start = sorted(
+        (r.start_ns, r.ttft_ms) for r in requests if not r.failed and r.ttft_ms is not None
+    )
+    ttft_starts = [ns for ns, _ in ttft_by_start]
+
     windows = []
-    for index in range(math.ceil(horizon / WINDOW_S)):
-        start, end = index * WINDOW_S, (index + 1) * WINDOW_S
-        sent = [r for r in rows if start <= r["sent"] < end]
-        ttft = [r["ttft"] for r in sent if not r["failed"] and r["ttft"] is not None]
-        windows.append(
-            {
-                "window_start_s": start,
-                "sent_rps": len(sent) / WINDOW_S,
-                "completed_rps": sum(start <= r["end"] < end for r in rows) / WINDOW_S,
-                "in_flight_at_end": sum(r["sent"] < end <= r["end"] for r in rows),
-                "failed_requests": sum(r["failed"] for r in sent),
-                "p50_ttft_ms": _percentile(ttft, 50),
-                "p99_ttft_ms": _percentile(ttft, 99),
-            }
-        )
-    return windows
+    for i, b in enumerate(buckets):
+        start_s, end_s = i * window_s, (i + 1) * window_s
+        boundary = t0 + round(end_s * 1e9)
+        ttft = sorted(b["ttft"])
+        queue = sorted(b["queue"])
+        window = {
+            "window_start_s": start_s,
+            "window_end_s": end_s,
+            "offered_requests": b["offered"],
+            "started_requests": b["started"],
+            "successful_completions": b["ok"],
+            "failed_completions": b["failed"],
+            "offered_rps": b["offered"] / window_s,
+            "started_rps": b["started"] / window_s,
+            "successful_completed_rps": b["ok"] / window_s,
+            "failed_completed_rps": b["failed"] / window_s,
+            # Started before the boundary and not ended before it.
+            "in_flight_at_end": bisect_left(starts, boundary) - bisect_left(ends, boundary),
+            "ttft_sample_count": len(ttft),
+            "p50_ttft_ms": percentile(ttft, 0.50),
+            "p90_ttft_ms": percentile(ttft, 0.90),
+            "p99_ttft_ms": percentile(ttft, 0.99),
+            "p50_client_queue_ms": percentile(queue, 0.50),
+            "p99_client_queue_ms": percentile(queue, 0.99),
+            "ttft_slo_attainment": (
+                sum(v <= ttft_slo_ms for v in ttft) / len(ttft)
+                if ttft_slo_ms is not None and ttft else None
+            ),
+        }
+        if tail_window_s is not None:
+            lo = bisect_left(ttft_starts, boundary - round(tail_window_s * 1e9))
+            hi = bisect_left(ttft_starts, boundary)
+            tail = sorted(v for _, v in ttft_by_start[lo:hi])
+            window["rolling_ttft_sample_count"] = len(tail)
+            window["rolling_p99_ttft_ms"] = percentile(tail, 0.99)
+        windows.append(window)
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "window_s": window_s,
+        "tail_window_s": tail_window_s,
+        "ttft_slo_ms": ttft_slo_ms,
+        "profiling_start_ns": t0,
+        "time_origin_source": source,
+        "malformed_record_count": malformed,
+        "windows": windows,
+    }

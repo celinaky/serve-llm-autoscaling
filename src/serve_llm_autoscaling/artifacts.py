@@ -140,17 +140,29 @@ def format_run_summary(root: Path) -> str:
                 f"{_fmt(p.get('p50_tpot_ms'), '.2f', 'ms'):>11}"
                 f"{_fmt(p.get('p99_e2el_ms'), '.1f', 'ms'):>11}"
             )
-    windows = _read_json(root / "benchmark" / "request-rate-series" / "windows.json")
-    if windows:
-        lines += ["", f"{'window':>9}{'sent/s':>8}{'done/s':>8}{'inflight':>10}"
-                      f"{'failed':>8}{'TTFT p50':>11}{'TTFT p99':>11}"]
-        for w in windows:
+    timeseries = _read_json(root / "analysis" / "request_timeseries.json")
+    if timeseries and timeseries.get("windows"):
+        lines += ["", f"{'window':>9}{'offered/s':>11}{'ok/s':>7}{'failed/s':>10}"
+                      f"{'inflight':>10}{'TTFT p50':>11}{'TTFT p99':>11}"]
+        for w in timeseries["windows"]:
             lines.append(
-                f"{w['window_start_s']:>8}s{w['sent_rps']:>8.1f}{w['completed_rps']:>8.1f}"
-                f"{w['in_flight_at_end']:>10}{w['failed_requests']:>8}"
+                f"{w['window_start_s']:>8g}s{w['offered_rps']:>11.1f}"
+                f"{w['successful_completed_rps']:>7.1f}{w['failed_completed_rps']:>10.1f}"
+                f"{w['in_flight_at_end']:>10}"
                 f"{_fmt(w['p50_ttft_ms'], '.0f', 'ms'):>11}"
                 f"{_fmt(w['p99_ttft_ms'], '.0f', 'ms'):>11}"
             )
+    analysis = manifest.get("analysis") or {}
+    if analysis:
+        lines.append("")
+        for key in ("analysis_error", "plot_error"):
+            if analysis.get(key):
+                lines.append(f"{key.replace('_', ' ').capitalize()}: {analysis[key]}")
+        for warning in analysis.get("warnings", []):
+            lines.append(f"Warning: {warning}")
+        timeline = root / "analysis" / "autoscaling_timeline.png"
+        if timeline.exists():
+            lines.append(f"Timeline:  {timeline}")
     return "\n".join(lines) + "\n"
 
 

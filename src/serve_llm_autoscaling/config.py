@@ -178,11 +178,28 @@ class RuntimeConfig(BaseModel):
     results_dir: Path = Path("runs")
 
 
+class AnalysisConfig(BaseModel):
+    window_s: float = Field(default=5, gt=0)
+    # Rolling window for tail latency; smooths p99 over sparse request windows.
+    tail_window_s: float = Field(default=30, gt=0)
+    telemetry_interval_s: float = Field(default=1, gt=0)
+    prometheus_enabled: bool = True
+    generate_plots: bool = True
+    ttft_slo_ms: float | None = Field(default=None, gt=0)
+
+    @model_validator(mode="after")
+    def validate_tail_window(self) -> "AnalysisConfig":
+        if self.tail_window_s < self.window_s:
+            raise ValueError("tail_window_s must be >= window_s")
+        return self
+
+
 class ExperimentConfig(BaseModel):
     name: str
     deployment: DeploymentConfig
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
 
     @model_validator(mode="after")
     def validate_context_length(self) -> "ExperimentConfig":

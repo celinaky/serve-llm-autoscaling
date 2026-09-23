@@ -4,6 +4,7 @@ import platform
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable
@@ -11,7 +12,8 @@ from typing import Any, Callable
 from .artifacts import RunArtifacts, format_run_summary, write_json
 from .backend import RayServeBackend
 from .benchmark import AIPerfRunner, aiperf_command
-from .config import ExperimentConfig
+from .config import ExperimentConfig, write_config
+from .telemetry import TelemetrySession
 
 
 def _aiperf_version() -> str:
@@ -43,7 +45,10 @@ def environment_check(connect: bool = True) -> dict[str, Any]:
     return result
 
 
-def run_benchmarks(config: ExperimentConfig, root: Path) -> list[dict[str, Any]]:
+def run_benchmarks(
+    config: ExperimentConfig, root: Path, telemetry: TelemetrySession | None = None
+) -> list[dict[str, Any]]:
+    """Run the configured benchmarks, collecting ``telemetry`` for their duration."""
     runner = AIPerfRunner(config, root / "benchmark")
     summary: list[dict[str, Any]] = []
     jobs: list[tuple[Any, Callable[[], dict[str, Any]]]]
@@ -58,22 +63,59 @@ def run_benchmarks(config: ExperimentConfig, root: Path) -> list[dict[str, Any]]
             )
             for level in config.benchmark.levels
         ]
-    for level, job in jobs:
-        try:
-            row = job()
-        except Exception as exc:
-            row = {
-                "mode": config.benchmark.mode,
-                "level": level,
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-            summary.append(row)
-            write_json(root / "benchmark" / "sweep_summary.json", summary)
-            if config.benchmark.fail_fast:
-                raise
-        else:
-            summary.append(row)
-            write_json(root / "benchmark" / "sweep_summary.json", summary)
+    # Collectors stop and flush on success, benchmark failure, or interrupt.
+    with telemetry or nullcontext():
+        for level, job in jobs:
+            try:
+                row = job()
+            except Exception as exc:
+                row = {
+                    "mode": config.benchmark.mode,
+                    "level": level,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                summary.append(row)
+                write_json(root / "benchmark" / "sweep_summary.json", summary)
+                if config.benchmark.fail_fast:
+                    raise
+            else:
+                summary.append(row)
+                write_json(root / "benchmark" / "sweep_summary.json", summary)
+    return summary
+
+
+def run_analysis(root: Path) -> dict[str, Any]:
+    """Derive the series analysis; failures are recorded, never raised."""
+    from .analysis import analyze_run
+
+    try:
+        return analyze_run(root)
+    except Exception as exc:
+        return {"analysis_error": f"{type(exc).__name__}: {exc}"}
+
+
+def run_manual_benchmark(config: ExperimentConfig, root: Path) -> list[dict[str, Any]]:
+    """Benchmark an existing deployment, with telemetry if Ray is reachable."""
+    (root / "benchmark").mkdir(parents=True, exist_ok=True)
+    if config.benchmark.mode != "request_rate_series":
+        return run_benchmarks(config, root)
+    write_config(config, root / "resolved.yaml")
+    telemetry = None
+    try:
+        RayServeBackend(config).connect()
+        telemetry = TelemetrySession(config, root)
+    except Exception as exc:
+        print(
+            f"WARNING: running without Serve telemetry; could not connect to Ray "
+            f"({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+    summary = run_benchmarks(config, root, telemetry)
+    for warning in (analysis := run_analysis(root)).get("warnings", []):
+        print(f"WARNING: {warning}", file=sys.stderr)
+    for key in ("analysis_error", "plot_error"):
+        if analysis.get(key):
+            print(f"WARNING: {key}: {analysis[key]}", file=sys.stderr)
     return summary
 
 
@@ -113,7 +155,19 @@ def run_experiment(
         artifacts.record_event("deployment_ready")
 
         stage = "benchmark"
-        summary = run_benchmarks(config, artifacts.root)
+        series = config.benchmark.mode == "request_rate_series"
+        # Start telemetry immediately before AIPerf; static sweeps collect none.
+        telemetry = TelemetrySession(config, artifacts.root) if series else None
+        try:
+            summary = run_benchmarks(config, artifacts.root, telemetry)
+        finally:
+            if telemetry is not None:
+                artifacts.manifest["telemetry"] = telemetry.summary()
+                artifacts.flush_manifest()
+        if series:
+            stage = "analysis"
+            artifacts.manifest["analysis"] = run_analysis(artifacts.root)
+            artifacts.flush_manifest()
         if not any(row.get("error") is None for row in summary):
             raise RuntimeError("all benchmark points failed")
         artifacts.finish("succeeded")

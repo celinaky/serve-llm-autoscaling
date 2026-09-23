@@ -74,6 +74,7 @@ def _benchmark(**benchmark):
         "experiments/baseline_rate.yaml",
         "experiments/smoke.yaml",
         "experiments/step_rate.yaml",
+        "experiments/step_rate_autoscaling.yaml",
         "experiments/smoke_rate_series.yaml",
     ],
 )
@@ -159,3 +160,32 @@ def test_rejects_series_flags_in_extra_args(flag):
             rate_series=SERIES,
             extra_args=[flag, "x"],
         )
+
+
+def test_analysis_defaults():
+    analysis = load_config(Path("experiments/step_rate.yaml")).analysis
+    assert (analysis.window_s, analysis.tail_window_s, analysis.telemetry_interval_s) == (
+        5, 30, 1
+    )
+    assert analysis.prometheus_enabled and analysis.generate_plots
+    assert analysis.ttft_slo_ms is None
+
+
+def test_rejects_tail_window_shorter_than_window():
+    with pytest.raises(ValidationError, match="tail_window_s must be >= window_s"):
+        ExperimentConfig.model_validate({
+            "name": "bad", "deployment": {"model_id": "model"},
+            "analysis": {"window_s": 10, "tail_window_s": 5},
+        })
+
+
+def test_autoscaling_experiment_matches_control_load():
+    control = load_config(Path("experiments/step_rate.yaml"))
+    autoscaled = load_config(Path("experiments/step_rate_autoscaling.yaml"))
+    assert autoscaled.benchmark == control.benchmark
+    assert autoscaled.deployment.model_id == control.deployment.model_id
+    assert control.deployment.autoscaling.max_replicas == 1
+    scaling = autoscaled.deployment.autoscaling
+    assert (scaling.min_replicas, scaling.initial_replicas, scaling.max_replicas) == (1, 1, 4)
+    assert (scaling.target_ongoing_requests, scaling.upscale_delay_s,
+            scaling.downscale_delay_s) == (4, 30, 120)

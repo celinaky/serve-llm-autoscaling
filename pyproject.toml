@@ -9,6 +9,8 @@ description = "Experiment harness for Ray Serve LLM autoscaling"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "matplotlib",
+    "prometheus-client",
     "pydantic>=2",
     "pyyaml",
     "requests",

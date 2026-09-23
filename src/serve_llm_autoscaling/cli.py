@@ -8,9 +8,8 @@ from pathlib import Path
 import yaml
 
 from .backend import RayServeBackend
-from .benchmark import AIPerfRunner
 from .config import load_config
-from .runner import environment_check, run_benchmarks, run_experiment
+from .runner import environment_check, run_experiment, run_manual_benchmark
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,6 +27,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("config", type=Path)
     run.add_argument("--replace", action="store_true")
     run.add_argument("--keep-deployment", action="store_true", default=None)
+    analyze = subparsers.add_parser(
+        "analyze", help="Regenerate a series run's analysis from its saved artifacts"
+    )
+    analyze.add_argument("run_dir", type=Path)
+    analyze.add_argument("--window-s", type=float)
+    analyze.add_argument("--tail-window-s", type=float)
+    analyze.add_argument("--no-plot", action="store_true")
     return parser
 
 
@@ -36,6 +42,22 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "check":
             print(json.dumps(environment_check(connect=True), indent=2, default=str))
+            return 0
+        if args.command == "analyze":
+            from .analysis import analyze_run
+
+            result = analyze_run(
+                args.run_dir,
+                window_s=args.window_s,
+                tail_window_s=args.tail_window_s,
+                plot=False if args.no_plot else None,
+            )
+            for warning in result["warnings"]:
+                print(f"WARNING: {warning}", file=sys.stderr)
+            print(f"Analysis artifacts: {args.run_dir / 'analysis'}")
+            if result["plot_error"]:
+                print(f"ERROR: plot failed: {result['plot_error']}", file=sys.stderr)
+                return 1
             return 0
 
         config = load_config(args.config)
@@ -56,8 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             backend.teardown()
         elif args.command == "benchmark":
             root = config.runtime.results_dir / f"manual-{config.name}"
-            (root / "benchmark").mkdir(parents=True, exist_ok=True)
-            print(json.dumps(run_benchmarks(config, root), indent=2, default=str))
+            print(json.dumps(run_manual_benchmark(config, root), indent=2, default=str))
         elif args.command == "run":
             root = run_experiment(
                 config,
