@@ -12,7 +12,7 @@ from typing import Any, Callable
 from .artifacts import RunArtifacts, format_run_summary, write_json
 from .backend import RayServeBackend
 from .benchmark import AIPerfRunner, aiperf_command
-from .config import ExperimentConfig, write_config
+from .config import CONTINUOUS_MODES, AgentXWorkloadConfig, ExperimentConfig, write_config
 from .telemetry import TelemetrySession
 
 
@@ -51,10 +51,13 @@ def run_benchmarks(
     """Run the configured benchmarks, collecting ``telemetry`` for their duration."""
     runner = AIPerfRunner(config, root / "benchmark")
     summary: list[dict[str, Any]] = []
+    workload = config.benchmark.workload
     jobs: list[tuple[Any, Callable[[], dict[str, Any]]]]
+    # Continuous modes are one AIPerf process, summarized as a single row.
     if config.benchmark.mode == "request_rate_series":
-        # A series is one continuous AIPerf process, summarized as a single row.
         jobs = [("series", runner.run_series)]
+    elif isinstance(workload, AgentXWorkloadConfig):
+        jobs = [(workload.target_concurrency, runner.run_agentx_ramp)]
     else:
         jobs = [
             (
@@ -69,11 +72,11 @@ def run_benchmarks(
             try:
                 row = job()
             except Exception as exc:
-                row = {
-                    "mode": config.benchmark.mode,
-                    "level": level,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
+                row = {"mode": config.benchmark.mode, "level": level}
+                if isinstance(workload, AgentXWorkloadConfig):
+                    row["target_concurrency"] = workload.target_concurrency
+                    row["ramp_duration_s"] = workload.concurrency_ramp_duration_s
+                row["error"] = f"{type(exc).__name__}: {exc}"
                 summary.append(row)
                 write_json(root / "benchmark" / "sweep_summary.json", summary)
                 if config.benchmark.fail_fast:
@@ -85,7 +88,7 @@ def run_benchmarks(
 
 
 def run_analysis(root: Path) -> dict[str, Any]:
-    """Derive the series analysis; failures are recorded, never raised."""
+    """Derive a continuous run's analysis; failures are recorded, never raised."""
     from .analysis import analyze_run
 
     try:
@@ -97,7 +100,7 @@ def run_analysis(root: Path) -> dict[str, Any]:
 def run_manual_benchmark(config: ExperimentConfig, root: Path) -> list[dict[str, Any]]:
     """Benchmark an existing deployment, with telemetry if Ray is reachable."""
     (root / "benchmark").mkdir(parents=True, exist_ok=True)
-    if config.benchmark.mode != "request_rate_series":
+    if config.benchmark.mode not in CONTINUOUS_MODES:
         return run_benchmarks(config, root)
     write_config(config, root / "resolved.yaml")
     telemetry = None
@@ -155,16 +158,16 @@ def run_experiment(
         artifacts.record_event("deployment_ready")
 
         stage = "benchmark"
-        series = config.benchmark.mode == "request_rate_series"
+        continuous = config.benchmark.mode in CONTINUOUS_MODES
         # Start telemetry immediately before AIPerf; static sweeps collect none.
-        telemetry = TelemetrySession(config, artifacts.root) if series else None
+        telemetry = TelemetrySession(config, artifacts.root) if continuous else None
         try:
             summary = run_benchmarks(config, artifacts.root, telemetry)
         finally:
             if telemetry is not None:
                 artifacts.manifest["telemetry"] = telemetry.summary()
                 artifacts.flush_manifest()
-        if series:
+        if continuous:
             stage = "analysis"
             artifacts.manifest["analysis"] = run_analysis(artifacts.root)
             artifacts.flush_manifest()

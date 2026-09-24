@@ -1,10 +1,35 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal, Union
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
+
+# Modes that run one uninterrupted load-generator process with telemetry,
+# mapped to their artifact directory below ``benchmark/``.
+CONTINUOUS_MODE_DIRS = {
+    "request_rate_series": "request-rate-series",
+    "agentx_concurrency_ramp": "agentx-concurrency-ramp",
+}
+CONTINUOUS_MODES = tuple(CONTINUOUS_MODE_DIRS)
+
+# The inferencex-agentx-mvp scenario rejects shorter runs unless overridden.
+AGENTX_MIN_DURATION_S = 900
+
+# Options the harness always sets on the AIPerf command line.
+COMMON_OWNED_ARGS = {
+    "--model", "--model-names", "--tokenizer", "--url", "--streaming",
+    "--isl", "--osl", "--random-seed", "--benchmark-duration",
+    "--artifact-dir", "--output-artifact-dir", "--concurrency",
+    "--request-rate", "--arrival-pattern", "--warmup-duration",
+    "--request-rate-series", "--arrival-smoothness",
+}
+AGENTX_OWNED_ARGS = {
+    "--scenario", "--public-dataset", "--concurrency-ramp-duration",
+    "--trajectory-start-min-ratio", "--trajectory-start-max-ratio",
+    "--unsafe-override",
+}
 
 
 class EngineConfig(BaseModel):
@@ -75,7 +100,7 @@ class WarmupConfig(BaseModel):
     duration_s: float = Field(default=30, gt=0)
 
 
-class WorkloadConfig(BaseModel):
+class SyntheticWorkloadConfig(BaseModel):
     type: Literal["synthetic"] = "synthetic"
     input_tokens: int = Field(default=8000, ge=1)
     output_tokens: int = Field(default=50, ge=1)
@@ -83,6 +108,38 @@ class WorkloadConfig(BaseModel):
     output_tokens_stddev: float = Field(default=0, ge=0)
     seed: int = 42
     ignore_eos: bool = True
+
+
+class AgentXWorkloadConfig(BaseModel):
+    """AgentX trace replay; concurrency counts live session trees, not requests."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["agentx"] = "agentx"
+    public_dataset: str = "semianalysis_cc_traces_weka_062126_256k"
+    target_concurrency: int = Field(ge=1, strict=True)
+    concurrency_ramp_duration_s: float = Field(gt=0)
+    # Used as both the min and max start ratio; 0 starts every trajectory cold
+    # at turn zero.
+    trajectory_start_ratio: float = Field(default=0, ge=0, le=1)
+    seed: int = 42
+    unsafe_override: bool = False
+
+
+def _workload_type(value: Any) -> str:
+    # ``type`` predates AgentX, so configs may omit it for synthetic workloads.
+    if isinstance(value, dict):
+        return value.get("type", "synthetic")
+    return getattr(value, "type", "synthetic")
+
+
+WorkloadConfig = Annotated[
+    Union[
+        Annotated[SyntheticWorkloadConfig, Tag("synthetic")],
+        Annotated[AgentXWorkloadConfig, Tag("agentx")],
+    ],
+    Discriminator(_workload_type),
+]
 
 
 class RequestRatePoint(BaseModel):
@@ -94,13 +151,15 @@ class RequestRatePoint(BaseModel):
 
 class BenchmarkConfig(BaseModel):
     generator: Literal["aiperf"] = "aiperf"
-    mode: Literal["concurrency", "request_rate", "request_rate_series"] = "concurrency"
+    mode: Literal[
+        "concurrency", "request_rate", "request_rate_series", "agentx_concurrency_ramp"
+    ] = "concurrency"
     # Only used by the static sweep modes; ignored for request_rate_series.
     levels: list[float] = Field(default_factory=lambda: [1, 2, 4, 8], min_length=1)
     duration_s: float = Field(default=120, gt=0)
     grace_period_s: float = Field(default=30, ge=0)
     warmup: WarmupConfig = Field(default_factory=WarmupConfig)
-    workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
+    workload: WorkloadConfig = Field(default_factory=SyntheticWorkloadConfig)
     streaming: bool = True
     arrival_pattern: Literal["constant", "poisson", "gamma"] = "poisson"
     arrival_smoothness: float | None = Field(default=None, gt=0)
@@ -113,7 +172,12 @@ class BenchmarkConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_levels(self) -> "BenchmarkConfig":
-        if self.mode == "request_rate_series":
+        agentx = isinstance(self.workload, AgentXWorkloadConfig)
+        if self.mode == "agentx_concurrency_ramp":
+            self._validate_agentx()
+        elif agentx:
+            raise ValueError("workload type agentx requires mode: agentx_concurrency_ramp")
+        elif self.mode == "request_rate_series":
             self._validate_rate_series()
         else:
             if self.rate_series is not None:
@@ -126,13 +190,7 @@ class BenchmarkConfig(BaseModel):
                 "arrival_smoothness requires arrival_pattern: gamma in a "
                 "request-rate mode"
             )
-        owned = {
-            "--model", "--model-names", "--tokenizer", "--url", "--streaming",
-            "--isl", "--osl", "--random-seed", "--benchmark-duration",
-            "--artifact-dir", "--output-artifact-dir", "--concurrency",
-            "--request-rate", "--arrival-pattern", "--warmup-duration",
-            "--request-rate-series", "--arrival-smoothness",
-        }
+        owned = COMMON_OWNED_ARGS | (AGENTX_OWNED_ARGS if agentx else set())
         conflicts = sorted(set(self.extra_args) & owned)
         if conflicts:
             raise ValueError(
@@ -140,6 +198,38 @@ class BenchmarkConfig(BaseModel):
                 + ", ".join(conflicts)
             )
         return self
+
+    def _validate_agentx(self) -> None:
+        workload = self.workload
+        if not isinstance(workload, AgentXWorkloadConfig):
+            raise ValueError("agentx_concurrency_ramp mode requires workload type: agentx")
+        # The trace replay owns arrivals and warmup; reject settings that would
+        # otherwise be silently ignored. Defaults are accepted so that a
+        # resolved config, which lists every field, still loads.
+        unsupported = sorted(
+            name
+            for name in ("levels", "rate_series", "arrival_pattern",
+                         "arrival_smoothness", "warmup")
+            if getattr(self, name) != type(self).model_fields[name].get_default(
+                call_default_factory=True
+            )
+        )
+        if unsupported:
+            raise ValueError(
+                "agentx_concurrency_ramp mode does not accept: " + ", ".join(unsupported)
+            )
+        if not self.streaming:
+            raise ValueError("agentx_concurrency_ramp mode requires streaming: true")
+        if workload.concurrency_ramp_duration_s > self.duration_s:
+            raise ValueError(
+                f"concurrency_ramp_duration_s {workload.concurrency_ramp_duration_s} "
+                f"exceeds duration_s {self.duration_s}"
+            )
+        if self.duration_s < AGENTX_MIN_DURATION_S and not workload.unsafe_override:
+            raise ValueError(
+                f"AgentX runs require duration_s >= {AGENTX_MIN_DURATION_S}; set "
+                "workload.unsafe_override: true for a shorter development run"
+            )
 
     def _validate_rate_series(self) -> None:
         points = self.rate_series
@@ -204,10 +294,10 @@ class ExperimentConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_context_length(self) -> "ExperimentConfig":
-        required = (
-            self.benchmark.workload.input_tokens
-            + self.benchmark.workload.output_tokens
-        )
+        workload = self.benchmark.workload
+        if not isinstance(workload, SyntheticWorkloadConfig):
+            return self  # trace lengths come from the dataset, not the config
+        required = workload.input_tokens + workload.output_tokens
         if required > self.deployment.engine.max_model_len:
             raise ValueError(
                 f"workload requires {required} tokens but max_model_len is "

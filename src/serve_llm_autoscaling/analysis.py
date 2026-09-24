@@ -1,4 +1,4 @@
-"""Offline analysis of a request-rate-series run directory.
+"""Offline analysis of a continuous (request-rate-series or AgentX) run directory.
 
 Everything here reads saved artifacts only, so it runs without Ray or a GPU
 and can be repeated with different windows after the experiment.
@@ -13,12 +13,17 @@ from typing import Any, Iterator
 import yaml
 
 from .artifacts import write_json
-from .config import AnalysisConfig, ExperimentConfig
+from .config import (
+    CONTINUOUS_MODE_DIRS,
+    AgentXWorkloadConfig,
+    AnalysisConfig,
+    ExperimentConfig,
+)
 from .telemetry import SELECTED_METRICS, normalize_metric_name
-from .windows import request_timeseries
+from .windows import configured_concurrency_at, request_timeseries
 
-SCHEMA_VERSION = 1
-SERIES_DIR = Path("benchmark") / "request-rate-series"
+# 2: ``request_rate_curve`` became the dimension-tagged ``configured_load``.
+SCHEMA_VERSION = 2
 
 # key -> (normalized sample name, aggregation, identity labels)
 #
@@ -59,6 +64,85 @@ def read_jsonl(path: Path) -> Iterator[dict[str, Any]]:
 def load_run_config(root: Path) -> ExperimentConfig:
     with (root / "resolved.yaml").open() as fh:
         return ExperimentConfig.model_validate(yaml.safe_load(fh))
+
+
+def workload_artifact_dir(root: Path, config: ExperimentConfig) -> Path:
+    """The raw AIPerf artifact directory of a continuous run."""
+    mode = config.benchmark.mode
+    if mode not in CONTINUOUS_MODE_DIRS:
+        raise ValueError(f"mode {mode!r} is not a continuous workload; nothing to analyze")
+    return root / "benchmark" / CONTINUOUS_MODE_DIRS[mode]
+
+
+# --- Configured load ----------------------------------------------------------
+
+
+def configured_load(config: ExperimentConfig, artifact_dir: Path) -> dict[str, Any]:
+    """The load the harness asked for, tagged with what it measures.
+
+    For AgentX this is session-tree concurrency, not a request rate: the
+    request rate it produces is an observed outcome.
+    """
+    benchmark = config.benchmark
+    workload = benchmark.workload
+    if isinstance(workload, AgentXWorkloadConfig):
+        ramp = workload.concurrency_ramp_duration_s
+        points = [{"time_s": 0.0, "value": 1.0},
+                  {"time_s": ramp, "value": float(workload.target_concurrency)}]
+        if benchmark.duration_s > ramp:
+            points.append({"time_s": benchmark.duration_s,
+                           "value": float(workload.target_concurrency)})
+        return {"dimension": "session_concurrency", "unit": "session trees",
+                "label": "configured session concurrency", "points": points,
+                "markers": [ramp]}
+    try:
+        curve = json.loads((artifact_dir / "rate_series.json").read_text())["points"]
+    except (OSError, ValueError, KeyError):
+        curve = [p.model_dump() for p in benchmark.rate_series or []]
+    return {"dimension": "request_rate", "unit": "requests/s", "label": "configured QPS",
+            "points": [{"time_s": p["time_s"], "value": p["qps"]} for p in curve],
+            "markers": [p["time_s"] for p in curve[1:]]}
+
+
+def concurrency_qps(
+    workload: AgentXWorkloadConfig, timeseries: dict[str, Any]
+) -> dict[str, Any]:
+    """Configured session concurrency beside the request rates it generated.
+
+    Concurrency is the configured ramp at each window's midpoint; the live
+    session count can briefly differ because of scheduling and tree turnover.
+    """
+    rows = []
+    for w in timeseries["windows"]:
+        mid = (w["window_start_s"] + w["window_end_s"]) / 2
+        sessions = configured_concurrency_at(
+            mid, workload.target_concurrency, workload.concurrency_ramp_duration_s
+        )
+        row = {
+            "window_start_s": w["window_start_s"],
+            "window_end_s": w["window_end_s"],
+            "configured_session_concurrency": sessions,
+            "offered_qps": w["offered_rps"],
+            "started_qps": w["started_rps"],
+            "successful_completed_qps": w["successful_completed_rps"],
+            "failed_completed_qps": w["failed_completed_rps"],
+            "in_flight_at_end": w["in_flight_at_end"],
+            # A diagnostic only: it varies with trace mix, think time,
+            # latency and subagent activity.
+            "requests_per_second_per_configured_session": w["offered_rps"] / sessions,
+        }
+        if "offered_root_rps" in w:
+            row["offered_root_qps"] = w["offered_root_rps"]
+            row["offered_subagent_qps"] = w["offered_subagent_rps"]
+        rows.append(row)
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "target_concurrency": workload.target_concurrency,
+        "ramp_duration_s": workload.concurrency_ramp_duration_s,
+        "window_s": timeseries["window_s"],
+        "summary": timeseries["summary"],
+        "windows": rows,
+    }
 
 
 # --- Metrics inventory ------------------------------------------------------
@@ -315,7 +399,7 @@ def build_plot_data(
     analysis: AnalysisConfig,
     timeseries: dict[str, Any],
 ) -> dict[str, Any]:
-    series_dir = root / SERIES_DIR
+    artifact_dir = workload_artifact_dir(root, config)
     warnings: list[str] = []
     t0 = timeseries["profiling_start_ns"]
     if t0 is None:
@@ -326,11 +410,6 @@ def build_plot_data(
         warnings.append(
             f"{timeseries['malformed_record_count']} malformed AIPerf records were skipped"
         )
-
-    try:
-        rate_curve = json.loads((series_dir / "rate_series.json").read_text())["points"]
-    except (OSError, ValueError, KeyError):
-        rate_curve = [p.model_dump() for p in config.benchmark.rate_series or []]
 
     application = config.deployment.application_name
     status_path = root / "telemetry" / "serve_status.jsonl"
@@ -367,7 +446,7 @@ def build_plot_data(
 
     manifest_end = None
     try:
-        phases = json.loads((series_dir / "phase_manifest.json").read_text())["phases"]
+        phases = json.loads((artifact_dir / "phase_manifest.json").read_text())["phases"]
         manifest_end = next(
             p.get("end_ns") for p in phases if p.get("phase_kind") == "profiling"
         )
@@ -395,13 +474,14 @@ def build_plot_data(
             "status_interval_s": analysis.status_interval_s,
             "metrics_interval_s": analysis.metrics_interval_s,
             "ttft_slo_ms": analysis.ttft_slo_ms,
+            "mode": config.benchmark.mode,
         },
         "time_origin": {
             "profiling_start_ns": t0,
             "source": timeseries["time_origin_source"],
             "profiling_end_s": (manifest_end - t0) / 1e9 if manifest_end else None,
         },
-        "request_rate_curve": rate_curve,
+        "configured_load": configured_load(config, artifact_dir),
         "request_windows": timeseries["windows"],
         "serve_status_samples": status,
         "serve_metric_series": series,
@@ -430,16 +510,18 @@ def analyze_run(
                  if v is not None}
     analysis = AnalysisConfig.model_validate({**config.analysis.model_dump(), **overrides})
     out = root / "analysis"
-    series_dir = root / SERIES_DIR
 
     timeseries = request_timeseries(
-        series_dir,
+        workload_artifact_dir(root, config),
         window_s=analysis.window_s,
         tail_window_s=analysis.tail_window_s,
         ttft_slo_ms=analysis.ttft_slo_ms,
         duration_s=config.benchmark.duration_s,
     )
     write_json(out / "request_timeseries.json", timeseries)
+    if isinstance(config.benchmark.workload, AgentXWorkloadConfig):
+        write_json(out / "concurrency_qps.json",
+                   concurrency_qps(config.benchmark.workload, timeseries))
     write_json(
         out / "metrics_inventory.json",
         build_metrics_inventory(root / "telemetry" / "serve_metrics.jsonl"),

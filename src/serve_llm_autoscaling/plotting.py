@@ -69,10 +69,18 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
     mids = [(w["window_start_s"] + w["window_end_s"]) / 2 for w in windows]
     ends = [w["window_end_s"] for w in windows]
 
-    # Panel 1: traffic.
-    curve = data["request_rate_curve"]
-    traffic.plot([p["time_s"] for p in curve], [p["qps"] for p in curve],
-                 "k--", lw=1.5, label="configured QPS")
+    # Panel 1: traffic. Observed request rates are on the left axis; AgentX
+    # configures session-tree concurrency, drawn on its own right axis.
+    load = data["configured_load"]
+    load_xs = [p["time_s"] for p in load["points"]]
+    load_ys = [p["value"] for p in load["points"]]
+    if load["dimension"] == "request_rate":
+        traffic.plot(load_xs, load_ys, "k--", lw=1.5, label=load["label"])
+    else:
+        sessions = twins[traffic] = traffic.twinx()
+        sessions.plot(load_xs, load_ys, "k--", lw=1.5, label=load["label"])
+        sessions.set_ylim(bottom=0, top=max(load_ys) * 1.1)
+        sessions.set_ylabel(load["unit"])
     for key, label, lw in (("offered_rps", "offered", 3), ("started_rps", "started", 1.5),
                            ("successful_completed_rps", "completed (ok)", 1.5)):
         if windows:
@@ -80,6 +88,11 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
     if any(w["failed_completed_rps"] for w in windows):
         traffic.stairs([w["failed_completed_rps"] for w in windows], edges,
                        label="completed (failed)", lw=1.5, color="red")
+    if any(w.get("offered_subagent_rps") for w in windows):
+        traffic.stairs([w["offered_root_rps"] for w in windows], edges,
+                       label="offered (root agents)", lw=1, ls=":")
+        traffic.stairs([w["offered_subagent_rps"] for w in windows], edges,
+                       label="offered (subagents)", lw=1, ls=":")
     traffic.set_ylabel("requests / s")
     traffic.set_title("Traffic", loc="left", fontsize=10)
 
@@ -150,8 +163,8 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
     replicas.set_title("Autoscaling", loc="left", fontsize=10)
 
     for ax in axes:
-        for point in curve[1:]:
-            ax.axvline(point["time_s"], color="gray", alpha=0.3, lw=0.8)
+        for marker in load["markers"]:
+            ax.axvline(marker, color="gray", alpha=0.3, lw=0.8)
         ax.grid(alpha=0.2)
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()

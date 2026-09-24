@@ -150,3 +150,148 @@ def test_normalize_aiperf():
     assert result["p99_ttft_ms"] == 20
     assert result["failed_requests"] == 2
 
+
+
+# --- AgentX concurrency ramp ------------------------------------------------
+
+SYNTHETIC_OR_RATE_FLAGS = [
+    "--isl", "--isl-stddev", "--osl", "--osl-stddev", "--request-rate",
+    "--request-rate-series", "--arrival-pattern", "--arrival-smoothness",
+    "--warmup-duration", "--extra-inputs",
+]
+
+
+def _arg(command, flag):
+    return command[command.index(flag) + 1]
+
+
+def test_build_agentx_ramp_command(agentx_config, monkeypatch, tmp_path: Path):
+    runner = AIPerfRunner(agentx_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    command = runner.build_agentx_ramp_command(tmp_path / "ramp")
+    assert command[:7] == [
+        "uvx", "--python", "3.11", "--from", "aiperf==0.12.0", "aiperf", "profile"
+    ]
+    assert _arg(command, "--scenario") == "inferencex-agentx-mvp"
+    assert _arg(command, "--public-dataset") == "semianalysis_cc_traces_weka_062126_256k"
+    assert _arg(command, "--concurrency") == "16"
+    assert _arg(command, "--concurrency-ramp-duration") == "1200.0"
+    assert _arg(command, "--trajectory-start-min-ratio") == "0.0"
+    assert _arg(command, "--trajectory-start-max-ratio") == "0.0"
+    assert _arg(command, "--benchmark-duration") == "1800.0"
+    assert _arg(command, "--benchmark-grace-period") == "300.0"
+    assert _arg(command, "--random-seed") == "42"
+    assert _arg(command, "--endpoint-type") == "chat"
+    assert _arg(command, "--export-level") == "records"
+    assert _arg(command, "--ui") == "none"
+    assert _arg(command, "--artifact-dir") == str(tmp_path / "ramp")
+    assert "--streaming" in command and "--use-server-token-count" in command
+    assert "--unsafe-override" not in command
+
+
+def test_agentx_command_has_no_synthetic_or_rate_flags(
+    agentx_config, monkeypatch, tmp_path: Path
+):
+    runner = AIPerfRunner(agentx_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    command = runner.build_agentx_ramp_command(tmp_path)
+    assert not set(command) & set(SYNTHETIC_OR_RATE_FLAGS)
+    assert not any("ignore_eos" in arg for arg in command)
+
+
+def test_agentx_command_unsafe_override(agentx_config, monkeypatch, tmp_path: Path):
+    config = agentx_config(
+        {"concurrency_ramp_duration_s": 60, "unsafe_override": True}, duration_s=120
+    )
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    command = AIPerfRunner(config, tmp_path).build_agentx_ramp_command(tmp_path)
+    assert command.count("--unsafe-override") == 1
+
+
+def test_agentx_command_appends_extra_args(agentx_config, monkeypatch, tmp_path: Path):
+    config = agentx_config(extra_args=["--request-timeout-seconds", "600"])
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    command = AIPerfRunner(config, tmp_path).build_agentx_ramp_command(tmp_path)
+    assert command[-2:] == ["--request-timeout-seconds", "600"]
+
+
+def test_synthetic_commands_reject_agentx_workload(agentx_config, monkeypatch, tmp_path):
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    with pytest.raises(TypeError, match="synthetic workload"):
+        AIPerfRunner(agentx_config(), tmp_path).build_command(4, tmp_path)
+
+
+def _agentx_record(credit_s, end_s, t0, error=None):
+    record = {
+        "metadata": {"credit_issued_ns": t0 + int(credit_s * 1e9),
+                     "request_start_ns": t0 + int(credit_s * 1e9),
+                     "request_end_ns": t0 + int(end_s * 1e9),
+                     "benchmark_phase": "profiling", "agent_depth": 0},
+        "metrics": {},
+    }
+    if error:
+        record["error"] = {"message": error}
+    return record
+
+
+def test_run_agentx_ramp(agentx_config, monkeypatch, tmp_path: Path):
+    config = agentx_config(
+        {"concurrency_ramp_duration_s": 5, "unsafe_override": True}, duration_s=10
+    )
+    runner = AIPerfRunner(config, tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    calls = []
+    t0 = 1_000 * 10**9
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        artifact_dir = Path(cmd[cmd.index("--artifact-dir") + 1])
+        (artifact_dir / "profile_export_aiperf.json").write_text(json.dumps({
+            "request_count": {"avg": 4}, "request_throughput": {"avg": 0.35},
+        }))
+        (artifact_dir / "phase_manifest.json").write_text(json.dumps({"phases": [
+            {"phase_kind": "profiling", "start_ns": t0, "end_ns": t0 + 12 * 10**9},
+        ]}))
+        records = [_agentx_record(1, 2, t0), _agentx_record(3, 4, t0),
+                   _agentx_record(5, 6, t0, error="boom"),
+                   # Completes in the grace period: outside the profiling interval.
+                   _agentx_record(9, 11, t0)]
+        (artifact_dir / "profile_export.jsonl").write_text(
+            "".join(json.dumps(r) + "\n" for r in records)
+        )
+        return benchmark.subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(benchmark.subprocess, "run", fake_run)
+    row = runner.run_agentx_ramp()
+    ramp_dir = tmp_path / "agentx-concurrency-ramp"
+    assert len(calls) == 1
+    assert row["artifact_dir"] == str(ramp_dir)
+    assert {k: row[k] for k in ("mode", "level", "target_concurrency", "ramp_duration_s",
+                                "error")} == {
+        "mode": "agentx_concurrency_ramp", "level": 16, "target_concurrency": 16,
+        "ramp_duration_s": 5, "error": None,
+    }
+    assert row["request_count"] == 4
+    # AIPerf's number and the harness-derived rates are distinct fields.
+    assert row["aiperf_request_throughput"] == 0.35
+    assert row["profiling_interval_s"] == 10
+    assert row["mean_offered_qps"] == pytest.approx(0.4)
+    assert row["mean_started_qps"] == pytest.approx(0.4)
+    assert row["mean_successful_qps"] == pytest.approx(0.2)
+    assert row["mean_failed_qps"] == pytest.approx(0.1)
+    for name in ["command.json", "stdout.log", "stderr.log", "profile_export.jsonl",
+                 "profile_export_aiperf.json", "phase_manifest.json"]:
+        assert (ramp_dir / name).exists()
+    argv = json.loads((ramp_dir / "command.json").read_text())["argv"]
+    assert "--scenario" in argv and "--unsafe-override" in argv
+
+
+def test_run_agentx_ramp_failure_points_to_stderr(agentx_config, monkeypatch, tmp_path):
+    runner = AIPerfRunner(agentx_config(), tmp_path)
+    monkeypatch.setattr(benchmark.shutil, "which", lambda name: f"/bin/{name}")
+    monkeypatch.setattr(
+        benchmark.subprocess, "run",
+        lambda cmd, **kwargs: benchmark.subprocess.CompletedProcess(cmd, 2),
+    )
+    with pytest.raises(RuntimeError, match="agentx-concurrency-ramp/stderr.log"):
+        runner.run_agentx_ramp()

@@ -188,3 +188,108 @@ def test_autoscaling_experiment_matches_control_load():
     assert (scaling.min_replicas, scaling.initial_replicas, scaling.max_replicas) == (1, 1, 4)
     assert (scaling.target_ongoing_requests, scaling.upscale_delay_s,
             scaling.downscale_delay_s) == (4, 30, 120)
+
+
+# --- AgentX concurrency ramp ------------------------------------------------
+
+
+def test_agentx_config_parses(agentx_config):
+    config = agentx_config()
+    workload = config.benchmark.workload
+    assert config.benchmark.mode == "agentx_concurrency_ramp"
+    assert workload.type == "agentx"
+    assert workload.public_dataset == "semianalysis_cc_traces_weka_062126_256k"
+    assert (workload.target_concurrency, workload.concurrency_ramp_duration_s) == (16, 1200)
+    assert workload.trajectory_start_ratio == 0 and not workload.unsafe_override
+
+
+def test_workload_type_defaults_to_synthetic():
+    config = _benchmark(workload={"input_tokens": 100})
+    assert config.benchmark.workload.type == "synthetic"
+
+
+def test_rejects_ramp_longer_than_duration(agentx_config):
+    with pytest.raises(ValidationError, match="exceeds duration_s"):
+        agentx_config({"concurrency_ramp_duration_s": 1801})
+
+
+def test_accepts_ramp_equal_to_duration(agentx_config):
+    agentx_config({"concurrency_ramp_duration_s": 1800})
+
+
+def test_agentx_mode_rejects_synthetic_workload():
+    with pytest.raises(ValidationError, match="requires workload type: agentx"):
+        _benchmark(mode="agentx_concurrency_ramp", duration_s=1800,
+                   workload={"type": "synthetic"})
+
+
+@pytest.mark.parametrize("mode", ["concurrency", "request_rate", "request_rate_series"])
+def test_agentx_workload_requires_agentx_mode(agentx_config, mode):
+    with pytest.raises(ValidationError, match="requires mode: agentx_concurrency_ramp"):
+        agentx_config(mode=mode)
+
+
+@pytest.mark.parametrize("value", [0, -1, 2.5, "4"])
+def test_rejects_bad_target_concurrency(agentx_config, value):
+    with pytest.raises(ValidationError, match="target_concurrency"):
+        agentx_config({"target_concurrency": value})
+
+
+@pytest.mark.parametrize(
+    "setting",
+    [
+        {"levels": [1, 2]},
+        {"rate_series": SERIES},
+        {"arrival_pattern": "constant"},
+        {"arrival_pattern": "gamma", "arrival_smoothness": 0.5},
+        {"warmup": {"enabled": True, "duration_s": 60}},
+        {"warmup": {"enabled": False}},
+    ],
+)
+def test_agentx_rejects_synthetic_load_settings(agentx_config, setting):
+    with pytest.raises(ValidationError, match="does not accept"):
+        agentx_config(**setting)
+
+
+def test_agentx_skips_synthetic_context_validation(agentx_config):
+    config = agentx_config()
+    config = ExperimentConfig.model_validate(
+        {**config.resolved_dict(),
+         "deployment": {"model_id": "m", "engine": {"max_model_len": 100}}}
+    )
+    assert config.deployment.engine.max_model_len == 100
+
+
+def test_rejects_short_strict_agentx_run(agentx_config):
+    with pytest.raises(ValidationError, match="duration_s >= 900"):
+        agentx_config({"concurrency_ramp_duration_s": 60}, duration_s=120)
+
+
+def test_accepts_short_agentx_run_with_unsafe_override(agentx_config):
+    config = agentx_config(
+        {"concurrency_ramp_duration_s": 60, "unsafe_override": True}, duration_s=120
+    )
+    assert config.benchmark.duration_s == 120
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--scenario", "--public-dataset", "--concurrency-ramp-duration",
+        "--trajectory-start-min-ratio", "--trajectory-start-max-ratio",
+        "--unsafe-override", "--concurrency", "--isl",
+    ],
+)
+def test_agentx_rejects_owned_flags_in_extra_args(agentx_config, flag):
+    with pytest.raises(ValidationError, match="harness-owned"):
+        agentx_config(extra_args=[flag, "x"])
+
+
+def test_agentx_rejects_unknown_workload_fields(agentx_config):
+    with pytest.raises(ValidationError, match="input_tokens"):
+        agentx_config({"input_tokens": 100})
+
+
+def test_agentx_resolved_config_round_trips(agentx_config):
+    config = agentx_config()
+    assert ExperimentConfig.model_validate(config.resolved_dict()) == config

@@ -10,6 +10,7 @@ from serve_llm_autoscaling.analysis import (
     build_plot_data,
     load_run_config,
     metric_series,
+    workload_artifact_dir,
 )
 from serve_llm_autoscaling.artifacts import write_json
 from serve_llm_autoscaling.cli import main
@@ -109,14 +110,17 @@ def test_plot_data_aligns_epoch_timestamps(tmp_path: Path):
     root = make_run(tmp_path / "run")
     analyze_run(root, plot=False)
     data = json.loads((root / "analysis" / "plot_data.json").read_text())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
     assert data["time_origin"] == {"profiling_start_ns": T0, "source": "phase_manifest",
                                    "profiling_end_s": 300.0}
     times = [s["relative_time_s"] for s in data["serve_status_samples"]]
     assert times == [-10.0, 2.0, 3.0, 90.0, 150.0]
     points = data["serve_metric_series"]["ongoing_requests"]["points"]
     assert points[0]["relative_time_s"] == -5.0 and points[1]["relative_time_s"] == 0.0
-    assert data["request_rate_curve"][2] == {"time_s": 60.1, "qps": 18.0}
+    load = data["configured_load"]
+    assert (load["dimension"], load["unit"]) == ("request_rate", "requests/s")
+    assert load["points"][2] == {"time_s": 60.1, "value": 18.0}
+    assert load["markers"] == [60.0, 60.1, 180.0, 180.1, 300.0]
     assert data["request_windows"][0]["ttft_sample_count"] == 3
     assert data["experiment"]["deployments"] == [LLM]
 
@@ -357,3 +361,107 @@ def test_build_plot_data_requires_time_origin(tmp_path: Path):
     config = load_run_config(root)
     with pytest.raises(ValueError, match="cannot align"):
         build_plot_data(root, config, config.analysis, request_timeseries(series))
+
+
+# --- AgentX concurrency ramp ------------------------------------------------
+
+
+def _agentx_request(credit_s, end_s, depth):
+    record = _request(credit_s, end_s)
+    record["metadata"]["agent_depth"] = depth
+    return record
+
+
+def make_agentx_run(root: Path, config) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    write_config(config, root / "resolved.yaml")
+    ramp = root / "benchmark" / "agentx-concurrency-ramp"
+    ramp.mkdir(parents=True)
+    duration = config.benchmark.duration_s
+    write_json(ramp / "phase_manifest.json", {"phases": [
+        {"phase_kind": "warmup", "start_ns": T0 - 30 * S, "end_ns": T0},
+        {"phase_kind": "profiling", "start_ns": T0, "end_ns": T0 + int(duration) * S},
+    ]})
+    records = [_agentx_request(t, t + 3, 0) for t in range(0, int(duration), 4)]
+    records += [_agentx_request(t + 1, t + 2, 1) for t in range(0, int(duration), 8)]
+    warmup = _agentx_request(-10, -9, 0)
+    warmup["metadata"]["benchmark_phase"] = "warmup"
+    _jsonl(ramp / "profile_export.jsonl", records + [warmup])
+    _jsonl(root / "telemetry" / "serve_status.jsonl",
+           [_status(0, ["RUNNING"]), _status(100, ["RUNNING", "STARTING"])])
+    return root
+
+
+@pytest.fixture
+def agentx_run(agentx_config, tmp_path: Path):
+    config = agentx_config(
+        {"concurrency_ramp_duration_s": 120, "target_concurrency": 4, "unsafe_override": True},
+        duration_s=200, grace_period_s=30,
+    )
+    return make_agentx_run(tmp_path / "run", config)
+
+
+def test_workload_artifact_dir(agentx_config, tmp_path: Path):
+    assert workload_artifact_dir(tmp_path, agentx_config()) == (
+        tmp_path / "benchmark" / "agentx-concurrency-ramp"
+    )
+    series = load_config("experiments/step_rate.yaml")
+    assert workload_artifact_dir(tmp_path, series) == (
+        tmp_path / "benchmark" / "request-rate-series"
+    )
+    with pytest.raises(ValueError, match="not a continuous workload"):
+        workload_artifact_dir(tmp_path, load_config("experiments/baseline.yaml"))
+
+
+def test_agentx_analysis_reads_ramp_artifacts(agentx_run: Path):
+    analyze_run(agentx_run, plot=False)
+    timeseries = json.loads((agentx_run / "analysis" / "request_timeseries.json").read_text())
+    assert timeseries["time_origin_source"] == "phase_manifest"
+    assert timeseries["windows"][0]["offered_requests"] == 3  # 2 root + 1 subagent
+    assert timeseries["summary"]["request_count"] == 75  # warmup excluded
+
+
+def test_agentx_plot_data_uses_session_concurrency(agentx_run: Path):
+    analyze_run(agentx_run, plot=False)
+    data = json.loads((agentx_run / "analysis" / "plot_data.json").read_text())
+    load = data["configured_load"]
+    assert load["dimension"] == "session_concurrency"
+    assert load["unit"] == "session trees"
+    assert load["label"] == "configured session concurrency"
+    assert "QPS" not in load["label"] and "qps" not in json.dumps(load)
+    assert load["points"] == [{"time_s": 0.0, "value": 1.0},
+                              {"time_s": 120.0, "value": 4.0},
+                              {"time_s": 200.0, "value": 4.0}]
+    assert load["markers"] == [120.0]
+    assert data["experiment"]["mode"] == "agentx_concurrency_ramp"
+
+
+def test_agentx_concurrency_qps_artifact(agentx_run: Path):
+    analyze_run(agentx_run, plot=False)
+    result = json.loads((agentx_run / "analysis" / "concurrency_qps.json").read_text())
+    assert (result["target_concurrency"], result["ramp_duration_s"]) == (4, 120)
+    first, *_ = windows = result["windows"]
+    # Midpoint 2.5s of a 1 -> 4 ramp over 120s.
+    assert first["configured_session_concurrency"] == pytest.approx(1 + 3 * 2.5 / 120)
+    assert first["offered_qps"] == pytest.approx(0.6)
+    assert (first["offered_root_qps"], first["offered_subagent_qps"]) == (0.4, 0.2)
+    assert first["requests_per_second_per_configured_session"] == pytest.approx(
+        0.6 / first["configured_session_concurrency"]
+    )
+    assert set(first) >= {"window_start_s", "window_end_s", "started_qps",
+                          "successful_completed_qps", "failed_completed_qps",
+                          "in_flight_at_end"}
+    assert windows[30]["configured_session_concurrency"] == 4.0  # after the ramp
+    assert result["summary"]["mean_offered_qps"] == pytest.approx(75 / 200)
+
+
+def test_agentx_plot_renders(agentx_run: Path):
+    result = analyze_run(agentx_run)
+    assert result["plot_error"] is None
+    assert (agentx_run / "analysis" / "autoscaling_timeline.png").stat().st_size > 10_000
+
+
+def test_series_run_writes_no_concurrency_artifact(tmp_path: Path):
+    root = make_run(tmp_path / "run")
+    analyze_run(root, plot=False)
+    assert not (root / "analysis" / "concurrency_qps.json").exists()

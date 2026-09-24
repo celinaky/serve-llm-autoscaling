@@ -9,10 +9,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import ExperimentConfig
+from .config import (
+    CONTINUOUS_MODE_DIRS,
+    AgentXWorkloadConfig,
+    ExperimentConfig,
+    SyntheticWorkloadConfig,
+)
+from .windows import profiling_qps_summary
 
 # AIPerf 0.12 needs Python 3.11+, which the Ray image's driver may not have.
 AIPERF_COMMAND = ["uvx", "--python", "3.11", "--from", "aiperf==0.12.0", "aiperf"]
+AGENTX_SCENARIO = "inferencex-agentx-mvp"
 
 
 def aiperf_command() -> list[str]:
@@ -59,9 +66,9 @@ class AIPerfRunner:
     config: ExperimentConfig
     benchmark_root: Path
 
-    def _base_command(self, artifact_dir: Path) -> list[str]:
+    def _common_args(self, artifact_dir: Path) -> list[str]:
+        """Arguments shared by every workload: target, duration and exports."""
         benchmark = self.config.benchmark
-        workload = benchmark.workload
         deployment = self.config.deployment
         cmd = [
             *aiperf_command(),
@@ -70,11 +77,6 @@ class AIPerfRunner:
             "--tokenizer", str(deployment.tokenizer),
             "--url", self.config.runtime.endpoint_url,
             "--endpoint-type", "chat",
-            "--isl", str(workload.input_tokens),
-            "--isl-stddev", str(workload.input_tokens_stddev),
-            "--osl", str(workload.output_tokens),
-            "--osl-stddev", str(workload.output_tokens_stddev),
-            "--random-seed", str(workload.seed),
             "--benchmark-duration", str(benchmark.duration_s),
             "--benchmark-grace-period", str(benchmark.grace_period_s),
             "--artifact-dir", str(artifact_dir),
@@ -85,10 +87,6 @@ class AIPerfRunner:
             cmd.append("--streaming")
         if benchmark.use_server_token_count:
             cmd.append("--use-server-token-count")
-        if workload.ignore_eos:
-            cmd.extend(["--extra-inputs", "ignore_eos:true"])
-        if benchmark.warmup.enabled:
-            cmd.extend(["--warmup-duration", str(benchmark.warmup.duration_s)])
         return cmd
 
     def _arrival_args(self) -> list[str]:
@@ -98,23 +96,67 @@ class AIPerfRunner:
             args.extend(["--arrival-smoothness", str(benchmark.arrival_smoothness)])
         return args
 
-    def build_command(self, level: float, artifact_dir: Path) -> list[str]:
+    def build_synthetic_command(
+        self, load_args: list[str], artifact_dir: Path
+    ) -> list[str]:
         benchmark = self.config.benchmark
-        cmd = self._base_command(artifact_dir)
-        if benchmark.mode == "concurrency":
-            cmd.extend(["--concurrency", str(int(level))])
-        else:
-            cmd.extend(["--request-rate", str(level), *self._arrival_args()])
+        workload = benchmark.workload
+        if not isinstance(workload, SyntheticWorkloadConfig):
+            raise TypeError("build_synthetic_command requires a synthetic workload")
+        cmd = self._common_args(artifact_dir)
+        cmd.extend([
+            "--isl", str(workload.input_tokens),
+            "--isl-stddev", str(workload.input_tokens_stddev),
+            "--osl", str(workload.output_tokens),
+            "--osl-stddev", str(workload.output_tokens_stddev),
+            "--random-seed", str(workload.seed),
+        ])
+        if workload.ignore_eos:
+            cmd.extend(["--extra-inputs", "ignore_eos:true"])
+        if benchmark.warmup.enabled:
+            cmd.extend(["--warmup-duration", str(benchmark.warmup.duration_s)])
+        cmd.extend(load_args)
         cmd.extend(benchmark.extra_args)
         return cmd
 
+    def build_command(self, level: float, artifact_dir: Path) -> list[str]:
+        if self.config.benchmark.mode == "concurrency":
+            load_args = ["--concurrency", str(int(level))]
+        else:
+            load_args = ["--request-rate", str(level), *self._arrival_args()]
+        return self.build_synthetic_command(load_args, artifact_dir)
+
     def build_series_command(self, series_path: Path, artifact_dir: Path) -> list[str]:
-        cmd = self._base_command(artifact_dir)
         # AIPerf refuses series paths with symlinked components; resolve them.
-        cmd.extend(
-            ["--request-rate-series", str(series_path.resolve()), *self._arrival_args()]
+        return self.build_synthetic_command(
+            ["--request-rate-series", str(series_path.resolve()), *self._arrival_args()],
+            artifact_dir,
         )
-        cmd.extend(self.config.benchmark.extra_args)
+
+    def build_agentx_ramp_command(self, artifact_dir: Path) -> list[str]:
+        """AgentX replay ramping session-tree concurrency from 1 to the target.
+
+        The scenario owns ignore_eos, cache busting and warmup, so none of the
+        synthetic or request-rate options are passed.
+        """
+        benchmark = self.config.benchmark
+        workload = benchmark.workload
+        if not isinstance(workload, AgentXWorkloadConfig):
+            raise TypeError("build_agentx_ramp_command requires an agentx workload")
+        ratio = str(workload.trajectory_start_ratio)
+        cmd = self._common_args(artifact_dir)
+        cmd.extend([
+            "--scenario", AGENTX_SCENARIO,
+            "--public-dataset", workload.public_dataset,
+            "--concurrency", str(workload.target_concurrency),
+            "--concurrency-ramp-duration", str(workload.concurrency_ramp_duration_s),
+            "--trajectory-start-min-ratio", ratio,
+            "--trajectory-start-max-ratio", ratio,
+            "--random-seed", str(workload.seed),
+        ])
+        if workload.unsafe_override:
+            cmd.append("--unsafe-override")
+        cmd.extend(benchmark.extra_args)
         return cmd
 
     def write_rate_series(self, path: Path) -> None:
@@ -138,12 +180,37 @@ class AIPerfRunner:
         )
 
     def run_series(self) -> dict[str, Any]:
-        series_dir = self.benchmark_root / "request-rate-series"
+        series_dir = self.benchmark_root / CONTINUOUS_MODE_DIRS["request_rate_series"]
         series_dir.mkdir(parents=True, exist_ok=False)
         series_path = series_dir / "rate_series.json"
         self.write_rate_series(series_path)
         cmd = self.build_series_command(series_path, series_dir)
         return self._execute(cmd, series_dir, "series")
+
+    def run_agentx_ramp(self) -> dict[str, Any]:
+        workload = self.config.benchmark.workload
+        assert isinstance(workload, AgentXWorkloadConfig)
+        ramp_dir = self.benchmark_root / CONTINUOUS_MODE_DIRS["agentx_concurrency_ramp"]
+        ramp_dir.mkdir(parents=True, exist_ok=False)
+        row = self._execute(
+            self.build_agentx_ramp_command(ramp_dir), ramp_dir, workload.target_concurrency
+        )
+        row.update({
+            "target_concurrency": workload.target_concurrency,
+            "ramp_duration_s": workload.concurrency_ramp_duration_s,
+            # Kept distinct from the harness-derived rates below.
+            "aiperf_request_throughput": row["request_throughput"],
+        })
+        try:
+            qps = profiling_qps_summary(ramp_dir, self.config.benchmark.duration_s)
+        except OSError as exc:
+            row["qps_summary_error"] = f"{type(exc).__name__}: {exc}"
+        else:
+            row.update({k: qps[k] for k in (
+                "profiling_interval_s", "mean_offered_qps", "mean_started_qps",
+                "mean_successful_qps", "mean_failed_qps",
+            )})
+        return row
 
     def _execute(self, cmd: list[str], point_dir: Path, level: Any) -> dict[str, Any]:
         with (point_dir / "command.json").open("w") as fh:

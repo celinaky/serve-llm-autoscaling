@@ -5,13 +5,19 @@ import numpy as np
 import pytest
 
 from serve_llm_autoscaling.artifacts import format_run_summary, write_json
-from serve_llm_autoscaling.windows import percentile, request_timeseries
+from serve_llm_autoscaling.windows import (
+    configured_concurrency_at,
+    percentile,
+    profiling_qps_summary,
+    request_timeseries,
+)
 
 S = 1_000_000_000
 T0 = 100 * S
 
 
-def _record(credit, end, start=None, ttft=10.0, phase="profiling", error=None):
+def _record(credit, end, start=None, ttft=10.0, phase="profiling", error=None,
+            depth=None):
     """A record with times in seconds since the profiling start."""
     start = credit if start is None else start
     record = {
@@ -20,6 +26,7 @@ def _record(credit, end, start=None, ttft=10.0, phase="profiling", error=None):
             "request_start_ns": T0 + int(start * S),
             "request_end_ns": T0 + int(end * S),
             "benchmark_phase": phase,
+            **({"agent_depth": depth} if depth is not None else {}),
         },
         "metrics": {"time_to_first_token": {"value": ttft}} if ttft is not None else {},
     }
@@ -185,3 +192,81 @@ def test_run_summary_prints_windows(tmp_path: Path):
     write_json(tmp_path / "manifest.json", {"name": "demo", "status": "succeeded"})
     write_json(tmp_path / "benchmark" / "sweep_summary.json", [])
     assert "TTFT p50" in format_run_summary(tmp_path)
+
+
+# --- Observed QPS -----------------------------------------------------------
+
+
+def test_qps_uses_credit_start_and_end_timestamps(tmp_path: Path):
+    # Credit at 4s, start at 6s, end at 11s: one event in each window.
+    first, second, third = request_timeseries(
+        _write(tmp_path, [_record(4, 11, start=6)])
+    )["windows"]
+    assert (first["offered_rps"], first["started_rps"],
+            first["successful_completed_rps"]) == (0.2, 0, 0)
+    assert (second["offered_rps"], second["started_rps"]) == (0, 0.2)
+    assert (third["successful_completed_rps"], third["offered_rps"]) == (0.2, 0)
+
+
+def test_failed_completion_qps_is_separate(tmp_path: Path):
+    window = request_timeseries(_write(tmp_path, [
+        _record(1, 2), _record(1, 3, error="boom", ttft=None),
+    ]))["windows"][0]
+    assert window["successful_completed_rps"] == 0.2
+    assert window["failed_completed_rps"] == 0.2
+
+
+def test_warmup_records_are_excluded_from_qps(tmp_path: Path):
+    result = request_timeseries(_write(tmp_path, [
+        _record(1, 2), _record(1, 2, phase="warmup"), _record(2, 3, phase="warmup"),
+    ]), duration_s=5)
+    assert result["windows"][0]["offered_requests"] == 1
+    assert result["summary"]["request_count"] == 1
+    assert result["summary"]["mean_offered_qps"] == 0.2
+
+
+def test_subagent_requests_count_and_split_by_depth(tmp_path: Path):
+    result = request_timeseries(_write(tmp_path, [
+        _record(1, 2, depth=0), _record(1, 2, depth=1), _record(2, 3, depth=2),
+    ]))
+    window = result["windows"][0]
+    assert result["agent_depth_available"] is True
+    assert window["offered_requests"] == 3  # subagents are real requests
+    assert (window["offered_root_requests"], window["offered_subagent_requests"]) == (1, 2)
+    assert window["offered_root_rps"] == 0.2
+    assert window["offered_subagent_rps"] == 0.4
+
+
+def test_depth_split_omitted_without_agent_depth(tmp_path: Path):
+    result = request_timeseries(_write(tmp_path, [_record(1, 2)]))
+    assert result["agent_depth_available"] is False
+    assert "offered_root_rps" not in result["windows"][0]
+
+
+@pytest.mark.parametrize(
+    ("time_s", "expected"), [(0, 1), (300, 4.75), (600, 8.5), (1199, 15.9875)]
+)
+def test_configured_concurrency_during_ramp(time_s, expected):
+    assert configured_concurrency_at(time_s, 16, 1200) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize("time_s", [1200, 1500, 1800])
+def test_configured_concurrency_holds_target_after_ramp(time_s):
+    assert configured_concurrency_at(time_s, 16, 1200) == 16.0
+
+
+def test_mean_qps_uses_profiling_interval(tmp_path: Path):
+    # The warmup record and the manifest's early phase would dilute a
+    # wall-clock rate; the grace-period completion is outside the interval.
+    _write(tmp_path, [
+        _record(-20, -19, phase="warmup"), _record(1, 2), _record(3, 4),
+        _record(5, 6, error="boom"), _record(9, 12),
+    ])
+    summary = profiling_qps_summary(tmp_path, duration_s=10)
+    assert summary["profiling_interval_s"] == 10
+    assert summary["request_count"] == 4 and summary["failed_requests"] == 1
+    assert summary["mean_offered_qps"] == pytest.approx(0.4)
+    assert summary["mean_started_qps"] == pytest.approx(0.4)
+    assert summary["mean_successful_qps"] == pytest.approx(0.2)
+    assert summary["mean_failed_qps"] == pytest.approx(0.1)
+    assert request_timeseries(tmp_path, duration_s=10)["summary"] == summary

@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--replace", action="store_true")
     run.add_argument("--keep-deployment", action="store_true", default=None)
     analyze = subparsers.add_parser(
-        "analyze", help="Regenerate a series run's analysis from its saved artifacts"
+        "analyze", help="Regenerate a continuous run's analysis from its saved artifacts"
     )
     analyze.add_argument("run_dir", type=Path)
     analyze.add_argument("--window-s", type=float)
