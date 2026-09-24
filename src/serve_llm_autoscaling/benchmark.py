@@ -11,6 +11,7 @@ from typing import Any
 
 from .config import (
     CONTINUOUS_MODE_DIRS,
+    SESSION_HEADER,
     AgentXWorkloadConfig,
     ExperimentConfig,
     SyntheticWorkloadConfig,
@@ -87,6 +88,10 @@ class AIPerfRunner:
             cmd.append("--streaming")
         if benchmark.use_server_token_count:
             cmd.append("--use-server-token-count")
+        if deployment.routing.policy == "consistent_hash":
+            # AIPerf sends one ID per session, so every turn hashes to the
+            # same replica. KV-aware routing scores prompt overlap instead.
+            cmd.extend(["--session-header", SESSION_HEADER])
         return cmd
 
     def _arrival_args(self) -> list[str]:

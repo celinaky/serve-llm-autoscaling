@@ -112,8 +112,20 @@ def _fake_cluster(monkeypatch, tmp_path: Path):
     from serve_llm_autoscaling.telemetry import TelemetrySession
 
     monkeypatch.setattr(runner, "environment_check", lambda connect: {})
-    for name, value in {"deploy": {}, "wait_healthy": {}, "teardown": None}.items():
+    monkeypatch.setattr(runner, "check_routing_support", lambda config: {
+        "policy": config.deployment.routing.policy, "request_router_class": "R",
+    })
+
+    def ready(self):
+        routing = self.config.deployment.routing
+        names = ["LLMRouter"] if routing.direct_streaming else ["OpenAiIngress"]
+        deployments = {name: {} for name in [*names, "LLMServer:m"]}
+        app = self.config.deployment.application_name
+        return {"serve_status": {"applications": {app: {"deployments": deployments}}}}
+
+    for name, value in {"deploy": {}, "teardown": None}.items():
         monkeypatch.setattr(runner.RayServeBackend, name, lambda self, v=value: v)
+    monkeypatch.setattr(runner.RayServeBackend, "wait_healthy", ready)
     sessions = []
 
     def session(config, root):

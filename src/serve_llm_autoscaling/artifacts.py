@@ -160,6 +160,12 @@ def format_run_summary(root: Path) -> str:
                 lines.append(f"{key.replace('_', ' ').capitalize()}: {analysis[key]}")
         for warning in analysis.get("warnings", []):
             lines.append(f"Warning: {warning}")
+        plot_data = _read_json(root / "analysis" / "plot_data.json") or {}
+        periods = (plot_data.get("lifecycle") or {}).get("periods") or []
+        if periods:
+            lines.append("Lifecycle: " + " · ".join(
+                f"{p['name']} {p['start_s']:.0f}-{p['end_s']:.0f}s" for p in periods
+            ))
         timeline = root / "analysis" / "autoscaling_timeline.png"
         if timeline.exists():
             lines.append(f"Timeline:  {timeline}")

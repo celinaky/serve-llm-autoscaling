@@ -69,6 +69,83 @@ class AutoscalingConfig(BaseModel):
         return self
 
 
+# Routing policy -> Ray request router class. Every policy is passed
+# explicitly: the default router differs between the ingress topology (power
+# of two) and direct streaming (round robin).
+ROUTER_CLASSES = {
+    "power_of_two": "ray.serve._private.request_router:PowerOfTwoChoicesRequestRouter",
+    "round_robin": "ray.serve.experimental.round_robin_router.RoundRobinRouter",
+    "consistent_hash": "ray.serve.experimental.consistent_hash_router.ConsistentHashRouter",
+    "prefix_cache_affinity": "ray.serve.llm.request_router.PrefixCacheAffinityRouter",
+    "kv_aware": "ray.serve.llm.request_router.KVAwareRouter",
+}
+# Policies that route on the prompt, so direct streaming must forward the body.
+BODY_AWARE_POLICIES = {"prefix_cache_affinity", "kv_aware"}
+# HTTP header that carries session affinity; Serve's default session-id header.
+SESSION_HEADER = "X-Session-ID"
+
+
+class RoutingConfig(BaseModel):
+    """Replica selection and the ingress topology in front of LLMServer.
+
+    ``None`` for ``direct_streaming`` or ``forward_request_body`` means the
+    policy decides: KV-aware routing needs both, and body-aware policies need
+    the body whenever direct streaming is on.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    policy: Literal[
+        "power_of_two", "round_robin", "consistent_hash", "prefix_cache_affinity", "kv_aware"
+    ] = "power_of_two"
+    direct_streaming: bool | None = None
+    forward_request_body: bool | None = None
+    # HAProxy's per-buffer cap on the body forwarded to the router; longer
+    # bodies are truncated and the router falls back to load balancing.
+    haproxy_request_buffer_bytes: int | None = Field(default=None, ge=1024)
+    request_router_kwargs: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def resolve_topology(self) -> "RoutingConfig":
+        kv_aware = self.policy == "kv_aware"
+        if kv_aware and self.direct_streaming is False:
+            raise ValueError("routing policy kv_aware requires direct_streaming: true")
+        if self.direct_streaming is None:
+            self.direct_streaming = kv_aware
+        if not self.direct_streaming:
+            if self.forward_request_body:
+                raise ValueError("forward_request_body requires direct_streaming: true")
+            self.forward_request_body = False
+        elif self.forward_request_body is None:
+            self.forward_request_body = self.policy in BODY_AWARE_POLICIES
+        elif kv_aware and not self.forward_request_body:
+            raise ValueError("routing policy kv_aware requires forward_request_body: true")
+        if self.haproxy_request_buffer_bytes is not None and not self.forward_request_body:
+            raise ValueError("haproxy_request_buffer_bytes requires forward_request_body: true")
+        return self
+
+    @property
+    def router_class(self) -> str:
+        return ROUTER_CLASSES[self.policy]
+
+    def environment(self) -> dict[str, str]:
+        """Ray switches for this topology, needed by the driver and controller."""
+        if not self.direct_streaming:
+            return {}
+        env = {
+            "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING": "1",
+            # LLMRouter is an ingress request router, which only HAProxy consults.
+            "RAY_SERVE_ENABLE_HA_PROXY": "1",
+        }
+        if self.forward_request_body:
+            env["RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY"] = "1"
+        if self.haproxy_request_buffer_bytes is not None:
+            env["RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_BUFSIZE"] = str(
+                self.haproxy_request_buffer_bytes
+            )
+        return env
+
+
 class DeploymentConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -78,7 +155,7 @@ class DeploymentConfig(BaseModel):
     tokenizer: str | None = None
     accelerator_type: str | None = None
     route_prefix: str = "/"
-    direct_streaming: bool = False
+    routing: RoutingConfig = Field(default_factory=RoutingConfig)
     engine: EngineConfig = Field(default_factory=EngineConfig)
     autoscaling: AutoscalingConfig = Field(default_factory=AutoscalingConfig)
     max_ongoing_requests: int = Field(default=8192, ge=1)
@@ -158,6 +235,9 @@ class BenchmarkConfig(BaseModel):
     levels: list[float] = Field(default_factory=lambda: [1, 2, 4, 8], min_length=1)
     duration_s: float = Field(default=120, gt=0)
     grace_period_s: float = Field(default=30, ge=0)
+    # Idle telemetry after AIPerf exits, to watch recovery and downscaling
+    # with no requests left in flight. Continuous modes only.
+    post_load_observation_s: float = Field(default=0, ge=0)
     warmup: WarmupConfig = Field(default_factory=WarmupConfig)
     workload: WorkloadConfig = Field(default_factory=SyntheticWorkloadConfig)
     streaming: bool = True
@@ -183,6 +263,11 @@ class BenchmarkConfig(BaseModel):
             if self.rate_series is not None:
                 raise ValueError("rate_series requires mode: request_rate_series")
             self._validate_static_levels()
+        if self.post_load_observation_s and self.mode not in CONTINUOUS_MODES:
+            raise ValueError(
+                "post_load_observation_s requires a continuous mode: "
+                + ", ".join(CONTINUOUS_MODES)
+            )
         if self.arrival_smoothness is not None and (
             self.arrival_pattern != "gamma" or self.mode == "concurrency"
         ):
@@ -291,6 +376,18 @@ class ExperimentConfig(BaseModel):
     benchmark: BenchmarkConfig = Field(default_factory=BenchmarkConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     analysis: AnalysisConfig = Field(default_factory=AnalysisConfig)
+
+    @model_validator(mode="after")
+    def validate_session_header(self) -> "ExperimentConfig":
+        if (
+            self.deployment.routing.policy == "consistent_hash"
+            and "--session-header" in self.benchmark.extra_args
+        ):
+            raise ValueError(
+                "extra_args cannot override --session-header; consistent_hash "
+                f"routing sets it to {SESSION_HEADER}"
+            )
+        return self
 
     @model_validator(mode="after")
     def validate_context_length(self) -> "ExperimentConfig":

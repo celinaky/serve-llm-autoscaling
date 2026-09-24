@@ -32,16 +32,27 @@ def percentile(ordered: list[float], q: float) -> float | None:
     return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
 
 
-def profiling_start_ns(artifact_dir: Path) -> int | None:
-    """Profiling start from AIPerf's phase manifest, if it is usable."""
+def profiling_phase_ns(artifact_dir: Path) -> tuple[int | None, int | None]:
+    """Profiling (start, end) from AIPerf's phase manifest, where usable.
+
+    The end is when AIPerf closed the phase, after draining in-flight requests.
+    """
     try:
         manifest = json.loads((artifact_dir / "phase_manifest.json").read_text())
-        return next(
-            int(p["start_ns"]) for p in manifest["phases"]
-            if p.get("phase_kind") == "profiling"
-        )
+        phase = next(p for p in manifest["phases"] if p.get("phase_kind") == "profiling")
+        start = int(phase["start_ns"])
     except (OSError, ValueError, KeyError, TypeError, StopIteration):
-        return None
+        return None, None
+    try:
+        end = int(phase["end_ns"])
+    except (KeyError, ValueError, TypeError):
+        end = None
+    return start, end
+
+
+def profiling_start_ns(artifact_dir: Path) -> int | None:
+    """Profiling start from AIPerf's phase manifest, if it is usable."""
+    return profiling_phase_ns(artifact_dir)[0]
 
 
 def _parse(line: str) -> _Request | None:
@@ -152,6 +163,7 @@ def request_timeseries(
     tail_window_s: float | None = None,
     ttft_slo_ms: float | None = None,
     duration_s: float | None = None,
+    horizon_s: float | None = None,
 ) -> dict[str, Any]:
     """Summarize a series run's profiling records in fixed windows.
 
@@ -160,7 +172,8 @@ def request_timeseries(
     started. Credits and starts fall in ``[start, end)`` windows, completions in
     ``(start, end]``, so a request ending exactly on a boundary completes in the
     earlier window and is no longer in flight at that boundary. Windows continue
-    until the last request finishes.
+    until the last request finishes, or until ``horizon_s`` if later (the end
+    of post-load observation, so idle windows read as zero traffic).
     """
     requests, malformed = _read_requests(artifact_dir / "profile_export.jsonl")
     t0, source = _time_origin(artifact_dir, requests)
@@ -173,7 +186,7 @@ def request_timeseries(
 
     count = 0
     if t0 is not None:
-        horizon = max([duration_s or 0.0] + [rel(r.end_ns) for r in requests])
+        horizon = max([duration_s or 0.0, horizon_s or 0.0] + [rel(r.end_ns) for r in requests])
         count = math.ceil(horizon / window_s)
 
     def index(ns: int, *, closed_right: bool = False) -> int | None:

@@ -139,9 +139,21 @@ then holds at the target until `duration_s`.
 **Prerequisite:** the default dataset,
 `semianalysis_cc_traces_weka_062126_256k`, contains traces up to 256K tokens.
 Use a model and deployment whose context window (`engine.max_model_len`) fits
-them. The checked-in 10K-context Qwen experiments are not suitable, so there
-is no checked-in AgentX experiment; adapt this example for a long-context
-model:
+them. The 10K-context Qwen3-0.6B experiments are not suitable.
+
+`experiments/agentx_kv_aware_autoscaling.yaml` is a checked-in short
+development run. It serves `Qwen/Qwen3.6-27B-FP8`, a dense hybrid-attention
+model with a 262,144-token context, on one RTX PRO 6000 (96GB) per replica,
+autoscaling from 1 to 4 replicas behind KV-aware routing. It ramps to 32
+sessions over 150s, issues load for 210s, drains for up to 30s, then observes
+the idle deployment for 90s. It needs `ai-dynamo>=1.4.0` (see
+[Routing](#routing)).
+
+```bash
+autoscale-harness run experiments/agentx_kv_aware_autoscaling.yaml
+```
+
+For a full-length run, adapt this example:
 
 ```yaml
 deployment:
@@ -277,11 +289,70 @@ seconds. Check `stdout.log`/`stderr.log` for
 issues no cache-priming requests for the initial sessions, and check in
 `profile_export.jsonl` that the first root conversations begin at turn zero.
 
+## Routing
+
+`deployment.routing` selects how Serve picks an LLM replica and the ingress
+topology in front of it:
+
+```yaml
+deployment:
+  routing:
+    policy: kv_aware                  # see the table below
+    direct_streaming: true            # LLMRouter + HAProxy instead of OpenAiIngress
+    forward_request_body: true        # let HAProxy pass the prompt to the router
+    haproxy_request_buffer_bytes: 8388608
+    request_router_kwargs: {}         # passed to the router class
+```
+
+| `policy` | Ray router class | Notes |
+| --- | --- | --- |
+| `power_of_two` (default) | `PowerOfTwoChoicesRequestRouter` | Serve's default for the ingress topology |
+| `round_robin` | `ray.serve.experimental.round_robin_router.RoundRobinRouter` | |
+| `consistent_hash` | `ray.serve.experimental.consistent_hash_router.ConsistentHashRouter` | AIPerf sends `--session-header X-Session-ID`, so each session's turns pin to one replica |
+| `prefix_cache_affinity` | `ray.serve.llm.request_router.PrefixCacheAffinityRouter` | Routes on the prompt text |
+| `kv_aware` | `ray.serve.llm.request_router.KVAwareRouter` | Scores prompt/KV-cache overlap; needs direct streaming, body forwarding and `ai-dynamo>=1.4.0` |
+
+The policy is always passed explicitly, because direct streaming otherwise
+defaults to round robin.
+
+- **Direct streaming** makes `LLMServer` the ingress deployment and attaches
+  `LLMRouter` as its ingress request router. HAProxy asks `LLMRouter` for a
+  replica and streams the response straight from it. The harness sets
+  `RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING=1` and `RAY_SERVE_ENABLE_HA_PROXY=1`
+  in the driver and passes them to the Serve controller through
+  `controller_options`. Because controller options apply only when the
+  controller starts, the harness shuts down any idle Serve instance first.
+- **Body forwarding** (`RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY=1`)
+  gives body-aware routers (`prefix_cache_affinity`, `kv_aware`) the prompt;
+  it is on by default for them under direct streaming. HAProxy truncates
+  bodies longer than `haproxy_request_buffer_bytes` (Ray's default is 256KiB),
+  and the router then falls back to load balancing. Long AgentX prompts need a
+  larger buffer.
+- `kv_aware` turns on direct streaming and body forwarding when they are left
+  unset, and rejects an explicit `false`.
+
+Before deploying, `run` and `deploy` check that the installed Ray provides the
+router class and, for `kv_aware`, that `ai-dynamo>=1.4.0` and
+`dynamo.llm.SelectionService` are importable. Without Dynamo, Ray would only
+log a warning and silently load-balance. Install it on every node:
+
+```bash
+pip install "ai-dynamo>=1.4.0"
+```
+
+After the deployment is ready, the harness verifies the Serve topology:
+`LLMRouter` without `OpenAiIngress` under direct streaming, and
+`OpenAiIngress` without `LLMRouter` otherwise. A mismatch fails the run at
+stage `topology`. The requested routing, the environment switches, the
+resolved router class and the verified deployments are written to
+`deployment/routing.json` and summarized under `routing` in `manifest.json`.
+
 ## Autoscaling telemetry and timeline
 
 While a continuous run (request-rate series or AgentX ramp) is in progress,
 two background collectors sample the cluster from immediately before AIPerf
-starts through its grace/drain period:
+starts, through its grace/drain period, to the end of any post-load
+observation:
 
 - **Serve status** (public `serve.status()`, every `analysis.status_interval_s`,
   default 1s) records realized capacity: replica counts by state (`STARTING`,
@@ -297,12 +368,27 @@ Both are stamped with the same epoch clock as AIPerf and aligned to AIPerf's
 profiling start. Collection failures are recorded as error samples and never
 stop the benchmark. Static sweeps collect no telemetry.
 
+Set `benchmark.post_load_observation_s` to keep collecting after AIPerf exits,
+with no requests in flight, to watch recovery and downscaling:
+
+```text
+0 ─── load issuance ─── duration_s ── drain (≤ grace_period_s) ── AIPerf exits ── idle observation ──
+```
+
+The harness records each boundary in epoch nanoseconds in
+`benchmark/lifecycle.json`: AIPerf launch, profiling start, ramp end (AgentX),
+load-issuance end (`profiling start + duration_s`), profiling-phase end (drain
+complete), AIPerf exit, and observation end. Observation is skipped when a
+`fail_fast` failure aborts the run, or when `benchmark` runs without
+telemetry. Only continuous modes accept a non-zero value.
+
 After the run, the harness derives the analysis from the raw artifacts:
 
 - **Request windows** (default 5s, `analysis.window_s`): offered load by credit
   issue time, actual starts, successful and failed completions, in-flight
   requests at each boundary, client queue delay, and TTFT percentiles grouped by
-  request start. Windows continue until the last request finishes.
+  request start. Windows continue until the last request finishes, or to the
+  end of post-load observation if that is later.
 - **Rolling tail latency**: TTFT p99 over the preceding `analysis.tail_window_s`
   (default 30s), which is stable even when a 5s window has few samples. Set
   `analysis.ttft_slo_ms` to also report SLO attainment.
@@ -319,8 +405,11 @@ After the run, the harness derives the analysis from the raw artifacts:
      starting and stopping replicas (status) as step functions.
 
   Vertical lines mark the load curve's control points, or the end of an
-  AgentX ramp. Signals that were not
-  collected are omitted with a warning rather than drawn as zero.
+  AgentX ramp. Dotted lines mark the end of load issuance, draining, AIPerf's
+  exit and observation. The drain period (requests still in flight) is shaded
+  orange, and the idle period (no requests) is shaded green. `plot_data.json`
+  carries these as `lifecycle.markers` and `lifecycle.periods`. Signals that
+  were not collected are omitted with a warning rather than drawn as zero.
 
 Regenerate the analysis with different windows without rerunning the
 experiment; this needs no Ray cluster or GPU:
@@ -344,7 +433,12 @@ benchmark/
 │   ├── phase_manifest.json       # profiling start time (the time origin)
 │   ├── profile_export.jsonl      # per-request AIPerf records
 │   └── profile_export_aiperf.json
+├── lifecycle.json                # load / drain / idle boundaries (epoch ns)
 └── sweep_summary.json            # aggregate metrics for the complete series
+deployment/
+├── config.json                   # LLMConfig payload
+├── routing.json                  # policy, env switches, resolved router, topology
+└── ...
 telemetry/                        # raw samples, never modified by analysis
 ├── serve_status.jsonl
 └── serve_metrics.jsonl

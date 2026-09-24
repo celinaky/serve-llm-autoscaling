@@ -7,7 +7,7 @@ from pathlib import Path
 
 import yaml
 
-from .backend import RayServeBackend
+from .backend import RayServeBackend, check_routing_support, verify_topology
 from .config import load_config
 from .runner import environment_check, run_experiment, run_manual_benchmark
 
@@ -70,8 +70,12 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "deploy":
             backend = RayServeBackend(config, replace=args.replace)
             print(json.dumps(backend.connect(), indent=2, default=str))
+            print(json.dumps(check_routing_support(config), indent=2, default=str))
             print(json.dumps(backend.deploy(), indent=2, default=str))
-            print(json.dumps(backend.wait_healthy(), indent=2, default=str))
+            ready = backend.wait_healthy()
+            print(json.dumps(ready, indent=2, default=str))
+            topology = verify_topology(config, ready["serve_status"])
+            print(json.dumps(topology, indent=2, default=str))
         elif args.command == "teardown":
             backend = RayServeBackend(config)
             backend.connect()

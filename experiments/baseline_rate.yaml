@@ -5,7 +5,9 @@ deployment:
   model_id: Qwen/Qwen3-0.6B-FP8
   model_source: Qwen/Qwen3-0.6B-FP8
   route_prefix: /
-  direct_streaming: false
+  routing:
+    policy: power_of_two
+    direct_streaming: false
   engine:
     tensor_parallel_size: 1
     max_model_len: 10000

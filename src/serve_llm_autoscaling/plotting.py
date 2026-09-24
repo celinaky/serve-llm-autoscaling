@@ -12,6 +12,10 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 
+PERIOD_COLORS = {"drain": "tab:orange", "idle": "tab:green"}
+PERIOD_LABELS = {"drain": "AIPerf draining", "idle": "idle (no requests)"}
+
+
 def primary_points(
     points: list[dict[str, Any]], key: str, *, step: bool = False
 ) -> tuple[list[float], list[float]]:
@@ -48,6 +52,8 @@ def _title(experiment: dict[str, Any]) -> str:
         f"replicas {experiment['min_replicas']}-{experiment['max_replicas']} "
         f"(initial {experiment['initial_replicas']}) · "
         f"target_ongoing_requests={experiment['target_ongoing_requests']:g} · "
+        f"routing {experiment.get('routing_policy', 'power_of_two')}"
+        f"{' (direct streaming)' if experiment.get('direct_streaming') else ''}\n"
         f"window {experiment['window_s']:g}s · "
         f"status every {experiment['status_interval_s']:g}s · "
         f"metrics every {experiment['metrics_interval_s']:g}s"
@@ -162,9 +168,21 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
     replicas.set_xlabel("seconds since profiling start")
     replicas.set_title("Autoscaling", loc="left", fontsize=10)
 
+    # Draining still has requests in flight; idle has none, so it shows
+    # recovery and downscaling on their own.
+    lifecycle = data.get("lifecycle") or {}
+    boundaries = {v for k, v in (lifecycle.get("markers") or {}).items()
+                  if v is not None and k != "ramp_end_s"}
     for ax in axes:
         for marker in load["markers"]:
             ax.axvline(marker, color="gray", alpha=0.3, lw=0.8)
+        for boundary in boundaries:
+            ax.axvline(boundary, color="black", alpha=0.5, lw=0.8, ls=":")
+        for period in lifecycle.get("periods") or []:
+            if period["name"] in PERIOD_COLORS:
+                ax.axvspan(period["start_s"], period["end_s"], color=PERIOD_COLORS[period["name"]],
+                           alpha=0.08, lw=0,
+                           label=PERIOD_LABELS[period["name"]] if ax is traffic else None)
         ax.grid(alpha=0.2)
     for ax in axes:
         handles, labels = ax.get_legend_handles_labels()
@@ -174,13 +192,14 @@ def plot_timeline(plot_data_path: Path, out_path: Path) -> None:
         if handles:
             ax.legend(handles, labels, loc="upper right", fontsize=8)
 
-    end = max(ends + [s["relative_time_s"] for s in status] + [1.0])
+    end = max(ends + [s["relative_time_s"] for s in status] + [1.0]
+              + [p["end_s"] for p in lifecycle.get("periods") or []])
     replicas.set_xlim(0, end)
     fig.suptitle(_title(experiment), fontsize=11)
     if data["warnings"]:
         fig.text(0.01, 0.005, "\n".join(data["warnings"][:6]), fontsize=7, color="dimgray",
                  va="bottom")
-    fig.tight_layout(rect=(0, 0.02 + 0.012 * min(len(data["warnings"]), 6), 1, 0.97))
+    fig.tight_layout(rect=(0, 0.02 + 0.012 * min(len(data["warnings"]), 6), 1, 0.96))
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=110)
     plt.close(fig)

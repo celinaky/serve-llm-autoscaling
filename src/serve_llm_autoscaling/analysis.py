@@ -23,7 +23,8 @@ from .telemetry import SELECTED_METRICS, normalize_metric_name
 from .windows import configured_concurrency_at, request_timeseries
 
 # 2: ``request_rate_curve`` became the dimension-tagged ``configured_load``.
-SCHEMA_VERSION = 2
+# 3: added ``lifecycle`` (load, drain and idle observation periods).
+SCHEMA_VERSION = 3
 
 # key -> (normalized sample name, aggregation, identity labels)
 #
@@ -74,6 +75,74 @@ def workload_artifact_dir(root: Path, config: ExperimentConfig) -> Path:
     return root / "benchmark" / CONTINUOUS_MODE_DIRS[mode]
 
 
+# --- Lifecycle ----------------------------------------------------------------
+
+
+def read_lifecycle(root: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads((root / "benchmark" / "lifecycle.json").read_text())
+    except (OSError, ValueError):
+        return None  # runs recorded before lifecycle.json, or interrupted ones
+
+
+def lifecycle_horizon_s(lifecycle: dict[str, Any] | None) -> float | None:
+    """Seconds from profiling start to the end of the recorded run."""
+    if not lifecycle or lifecycle.get("profiling_start_ns") is None:
+        return None
+    end = lifecycle.get("observation_end_ns") or lifecycle.get("aiperf_exited_ns")
+    return None if end is None else (end - lifecycle["profiling_start_ns"]) / 1e9
+
+
+def lifecycle_periods(
+    config: ExperimentConfig,
+    t0: int,
+    profiling_end_ns: int | None,
+    lifecycle: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Load, drain and idle periods on the profiling clock.
+
+    Draining ends when AIPerf closes the profiling phase; from then on no
+    request is in flight, whether AIPerf is still exporting or has exited and
+    the harness is observing recovery.
+    """
+    benchmark = config.benchmark
+    workload = benchmark.workload
+
+    def rel(ns: int | None) -> float | None:
+        return None if ns is None else (ns - t0) / 1e9
+
+    lifecycle = lifecycle or {}
+    load_end = benchmark.duration_s
+    aiperf_exit = rel(lifecycle.get("aiperf_exited_ns"))
+    drain_end = rel(profiling_end_ns)
+    if drain_end is None or drain_end < load_end:
+        drain_end = aiperf_exit
+    observation_end = rel(lifecycle.get("observation_end_ns"))
+    markers = {
+        "ramp_end_s": (
+            workload.concurrency_ramp_duration_s
+            if isinstance(workload, AgentXWorkloadConfig) else None
+        ),
+        "load_end_s": load_end,
+        "drain_end_s": drain_end,
+        "aiperf_exit_s": aiperf_exit,
+        "observation_end_s": observation_end,
+    }
+    periods = [{"name": "load", "start_s": 0.0, "end_s": load_end}]
+    if drain_end is not None and drain_end > load_end:
+        periods.append({"name": "drain", "start_s": load_end, "end_s": drain_end})
+    idle_end = observation_end or aiperf_exit
+    if drain_end is not None and idle_end is not None and idle_end > drain_end:
+        periods.append({"name": "idle", "start_s": drain_end, "end_s": idle_end})
+    return {
+        "source": "lifecycle.json" if lifecycle else "config",
+        "post_load_observation_s": benchmark.post_load_observation_s,
+        "observation_skipped": lifecycle.get("observation_skipped"),
+        "markers": markers,
+        "periods": periods,
+    }
+
+
 # --- Configured load ----------------------------------------------------------
 
 
@@ -105,17 +174,18 @@ def configured_load(config: ExperimentConfig, artifact_dir: Path) -> dict[str, A
 
 
 def concurrency_qps(
-    workload: AgentXWorkloadConfig, timeseries: dict[str, Any]
+    workload: AgentXWorkloadConfig, timeseries: dict[str, Any], duration_s: float
 ) -> dict[str, Any]:
     """Configured session concurrency beside the request rates it generated.
 
     Concurrency is the configured ramp at each window's midpoint; the live
     session count can briefly differ because of scheduling and tree turnover.
+    No sessions are configured once load issuance ends at ``duration_s``.
     """
     rows = []
     for w in timeseries["windows"]:
         mid = (w["window_start_s"] + w["window_end_s"]) / 2
-        sessions = configured_concurrency_at(
+        sessions = 0.0 if mid >= duration_s else configured_concurrency_at(
             mid, workload.target_concurrency, workload.concurrency_ramp_duration_s
         )
         row = {
@@ -129,7 +199,9 @@ def concurrency_qps(
             "in_flight_at_end": w["in_flight_at_end"],
             # A diagnostic only: it varies with trace mix, think time,
             # latency and subagent activity.
-            "requests_per_second_per_configured_session": w["offered_rps"] / sessions,
+            "requests_per_second_per_configured_session": (
+                w["offered_rps"] / sessions if sessions else None
+            ),
         }
         if "offered_root_rps" in w:
             row["offered_root_qps"] = w["offered_root_rps"]
@@ -398,6 +470,7 @@ def build_plot_data(
     config: ExperimentConfig,
     analysis: AnalysisConfig,
     timeseries: dict[str, Any],
+    lifecycle: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     artifact_dir = workload_artifact_dir(root, config)
     warnings: list[str] = []
@@ -453,6 +526,9 @@ def build_plot_data(
     except (OSError, ValueError, KeyError, StopIteration):
         pass
 
+    periods = lifecycle_periods(config, t0, manifest_end, lifecycle)
+    if periods["observation_skipped"]:
+        warnings.append(f"post-load observation skipped: {periods['observation_skipped']}")
     autoscaling = config.deployment.autoscaling
     return {
         "schema_version": SCHEMA_VERSION,
@@ -469,6 +545,9 @@ def build_plot_data(
             "downscale_delay_s": autoscaling.downscale_delay_s,
             "duration_s": config.benchmark.duration_s,
             "grace_period_s": config.benchmark.grace_period_s,
+            "post_load_observation_s": config.benchmark.post_load_observation_s,
+            "routing_policy": config.deployment.routing.policy,
+            "direct_streaming": config.deployment.routing.direct_streaming,
             "window_s": analysis.window_s,
             "tail_window_s": analysis.tail_window_s,
             "status_interval_s": analysis.status_interval_s,
@@ -482,6 +561,7 @@ def build_plot_data(
             "profiling_end_s": (manifest_end - t0) / 1e9 if manifest_end else None,
         },
         "configured_load": configured_load(config, artifact_dir),
+        "lifecycle": periods,
         "request_windows": timeseries["windows"],
         "serve_status_samples": status,
         "serve_metric_series": series,
@@ -511,22 +591,25 @@ def analyze_run(
     analysis = AnalysisConfig.model_validate({**config.analysis.model_dump(), **overrides})
     out = root / "analysis"
 
+    lifecycle = read_lifecycle(root)
     timeseries = request_timeseries(
         workload_artifact_dir(root, config),
         window_s=analysis.window_s,
         tail_window_s=analysis.tail_window_s,
         ttft_slo_ms=analysis.ttft_slo_ms,
         duration_s=config.benchmark.duration_s,
+        horizon_s=lifecycle_horizon_s(lifecycle),
     )
     write_json(out / "request_timeseries.json", timeseries)
     if isinstance(config.benchmark.workload, AgentXWorkloadConfig):
-        write_json(out / "concurrency_qps.json",
-                   concurrency_qps(config.benchmark.workload, timeseries))
+        write_json(out / "concurrency_qps.json", concurrency_qps(
+            config.benchmark.workload, timeseries, config.benchmark.duration_s
+        ))
     write_json(
         out / "metrics_inventory.json",
         build_metrics_inventory(root / "telemetry" / "serve_metrics.jsonl"),
     )
-    plot_data = build_plot_data(root, config, analysis, timeseries)
+    plot_data = build_plot_data(root, config, analysis, timeseries, lifecycle)
     write_json(out / "plot_data.json", plot_data)
 
     result: dict[str, Any] = {"warnings": plot_data["warnings"], "plot_error": None}

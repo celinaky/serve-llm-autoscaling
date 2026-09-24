@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import importlib
+import importlib.metadata
 import os
+import re
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +13,135 @@ from urllib.parse import urljoin
 import requests
 
 from .config import ExperimentConfig
+
+# Ray's KVAwareRouter scores replicas with Dynamo's selection service.
+MIN_AI_DYNAMO_VERSION = (1, 4, 0)
+# Switches that only matter to the direct-streaming topology; unset ones are
+# cleared so an earlier deploy in the same process cannot leak into this one.
+# RAY_SERVE_ENABLE_HA_PROXY is set when needed but never cleared: HAProxy in
+# front of OpenAiIngress is a valid, independent choice.
+ROUTING_ENV_VARS = (
+    "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING",
+    "RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY",
+    "RAY_SERVE_HAPROXY_INGRESS_REQUEST_ROUTER_BUFSIZE",
+)
+# (module, constant, env var) that Ray reads once at import time.
+_SNAPSHOTTED_FLAGS = (
+    ("ray.serve._private.constants", "RAY_SERVE_ENABLE_HA_PROXY",
+     "RAY_SERVE_ENABLE_HA_PROXY"),
+    ("ray.serve._private.constants", "RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY",
+     "RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY"),
+    ("ray.llm._internal.serve.constants", "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING",
+     "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING"),
+)
+
+
+def _release(version: str) -> tuple[int, ...]:
+    match = re.match(r"\d+(\.\d+)*", version)
+    if match is None:
+        raise ValueError(f"unparseable version {version!r}")
+    return tuple(int(part) for part in match.group().split("."))
+
+
+def check_routing_support(config: ExperimentConfig) -> dict[str, Any]:
+    """Fail before deploying if this environment cannot run the routing policy.
+
+    Checked in the driver, which shares the Anyscale image with the workers.
+    This is the first Ray Serve import, so it applies the routing environment.
+    """
+    routing = config.deployment.routing
+    apply_routing_environment(config)
+    from ray.serve.config import RequestRouterConfig
+
+    import ray
+
+    try:
+        router = RequestRouterConfig(
+            request_router_class=routing.router_class
+        ).get_request_router_class()
+    except Exception as exc:
+        raise RuntimeError(
+            f"routing policy {routing.policy!r} needs {routing.router_class}, which "
+            f"Ray {ray.__version__} does not provide ({type(exc).__name__}: {exc})"
+        ) from exc
+    result: dict[str, Any] = {
+        "policy": routing.policy,
+        "request_router_class": f"{router.__module__}.{router.__qualname__}",
+    }
+    if routing.policy == "kv_aware":
+        # Without Dynamo, Ray logs a warning and silently load-balances instead.
+        wanted = ".".join(map(str, MIN_AI_DYNAMO_VERSION))
+        try:
+            version = importlib.metadata.version("ai-dynamo")
+        except importlib.metadata.PackageNotFoundError:
+            raise RuntimeError(
+                f"routing policy kv_aware requires ai-dynamo>={wanted}; install it "
+                f"on every node (pip install 'ai-dynamo>={wanted}')"
+            ) from None
+        if _release(version) < MIN_AI_DYNAMO_VERSION:
+            raise RuntimeError(
+                f"routing policy kv_aware requires ai-dynamo>={wanted}, found {version}"
+            )
+        try:
+            importlib.import_module("dynamo.llm").SelectionService
+        except (ImportError, AttributeError) as exc:
+            raise RuntimeError(
+                f"ai-dynamo {version} is installed but dynamo.llm.SelectionService "
+                f"is not importable ({type(exc).__name__}: {exc})"
+            ) from exc
+        result["ai_dynamo_version"] = version
+    return result
+
+
+def apply_routing_environment(config: ExperimentConfig) -> dict[str, str]:
+    """Set the topology switches in this process before Ray Serve is imported.
+
+    Ray snapshots them into module constants on first import, so a module
+    imported earlier with different values is an error rather than ignored.
+    """
+    env = config.deployment.routing.environment()
+    for name in ROUTING_ENV_VARS:
+        if name not in env:
+            os.environ.pop(name, None)
+    os.environ.update(env)
+    stale = []
+    for module_name, constant, name in _SNAPSHOTTED_FLAGS:
+        module = sys.modules.get(module_name)
+        if module is None or name not in env:
+            continue
+        if getattr(module, constant, None) is not True:
+            stale.append(f"{module_name}.{constant}")
+    if stale:
+        raise RuntimeError(
+            "Ray Serve was imported before the routing environment was applied "
+            f"({', '.join(stale)}); export {', '.join(sorted(env))} before starting "
+            "the harness"
+        )
+    return env
+
+
+def verify_topology(config: ExperimentConfig, status: dict[str, Any]) -> dict[str, Any]:
+    """Check that Serve built the ingress topology the routing config asks for."""
+    application = config.deployment.application_name
+    app = (status.get("applications") or {}).get(application) or {}
+    names = sorted(app.get("deployments") or {})
+    has_router = "LLMRouter" in names
+    has_ingress = "OpenAiIngress" in names
+    if config.deployment.routing.direct_streaming:
+        if not has_router or has_ingress:
+            raise RuntimeError(
+                "direct streaming expected LLMRouter without OpenAiIngress, but "
+                f"application {application!r} has deployments {names}"
+            )
+        topology = "direct_streaming"
+    else:
+        if has_router or not has_ingress:
+            raise RuntimeError(
+                "expected the OpenAiIngress topology, but application "
+                f"{application!r} has deployments {names}"
+            )
+        topology = "openai_ingress"
+    return {"topology": topology, "deployments": names}
 
 
 def _jsonable(value: Any) -> Any:
@@ -64,6 +197,10 @@ class RayServeBackend:
                     exclude_none=True
                 ),
                 "max_ongoing_requests": deployment.max_ongoing_requests,
+                "request_router_config": {
+                    "request_router_class": deployment.routing.router_class,
+                    "request_router_kwargs": deployment.routing.request_router_kwargs,
+                },
             },
             "experimental_configs": deployment.experimental_configs,
         }
@@ -71,7 +208,18 @@ class RayServeBackend:
             spec["accelerator_type"] = deployment.accelerator_type
         return spec
 
+    def routing_summary(self) -> dict[str, Any]:
+        """The requested routing and the Ray switches that implement it."""
+        routing = self.config.deployment.routing
+        return {
+            **routing.model_dump(mode="json"),
+            "request_router_class": routing.router_class,
+            "environment": routing.environment(),
+        }
+
     def deploy(self) -> dict[str, Any]:
+        # Must precede the first Ray Serve import in this process.
+        env = apply_routing_environment(self.config)
         from ray import serve
 
         current = serve.status()
@@ -83,16 +231,10 @@ class RayServeBackend:
                     f"Serve already has application(s): {names}. Pass --replace to replace them."
                 )
             serve.shutdown()
-
-        # Body forwarding is only needed by the multi-model direct-streaming topology.
-        direct_env = "RAY_SERVE_LLM_ENABLE_DIRECT_STREAMING"
-        forward_body_env = "RAY_SERVE_INGRESS_REQUEST_ROUTER_FORWARD_BODY"
-        if self.config.deployment.direct_streaming:
-            os.environ[direct_env] = "1"
-            os.environ[forward_body_env] = "1"
-        else:
-            os.environ.pop(direct_env, None)
-            os.environ.pop(forward_body_env, None)
+        elif env:
+            # Controller options apply only when the controller starts, so an
+            # idle controller from an earlier run would keep its environment.
+            serve.shutdown()
 
         # Import after setting the topology switch; Ray snapshots some LLM flags
         # at module import time.
@@ -102,10 +244,14 @@ class RayServeBackend:
         app = build_openai_app(
             {"llm_configs": [LLMConfig(**self.deployment_spec())]}
         )
+        # HAProxy and its body forwarding are configured in the controller,
+        # which does not inherit the driver's environment.
+        controller_options = {"runtime_env": {"env_vars": env}} if env else None
         serve.run(
             app,
             name=deployment.application_name,
             route_prefix=deployment.route_prefix,
+            controller_options=controller_options,
         )
         return self.status()
 

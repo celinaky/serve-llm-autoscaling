@@ -1,0 +1,75 @@
+name: qwen-agentx-naive-autoscaling
+
+# Replays AgentX coding sessions against Qwen3.6-27B (dense, FP8) with
+# KV-aware routing, ramping session concurrency while Serve autoscales.
+#
+# Hardware: one RTX PRO 6000 (96GB) per replica. The FP8 weights take ~31GB;
+# only 16 of the 64 layers use full attention, so a full 262,144-token
+# context costs ~8.6GB of FP8 KV cache. max_replicas 4 uses 4 of the 8 GPUs.
+#
+# Requires ai-dynamo>=1.4.0 on every node for KV-aware routing; the harness
+# refuses to deploy without it.
+#
+# Timeline: load 0-210s, AIPerf drains for up to 30s, then 90s of idle
+# telemetry, so a run takes ~5.5 minutes after the deployment is ready.
+
+deployment:
+  application_name: ttft-benchmark
+  model_id: Qwen/Qwen3.6-27B-FP8
+  accelerator_type: RTX-PRO-6000
+  route_prefix: /
+  routing:
+    policy: kv_aware
+    direct_streaming: true
+    forward_request_body: true
+    # AgentX prompts reach 256K tokens (~1MB of text, more as chat JSON);
+    # a truncated body falls back to load-balanced routing. HAProxy uses up
+    # to ~2 buffers per connection, so ~0.5GB at 32 sessions.
+    haproxy_request_buffer_bytes: 8388608
+  engine:
+    tensor_parallel_size: 1
+    max_model_len: 262144
+    gpu_memory_utilization: 0.92
+    max_num_seqs: 128
+    max_num_batched_tokens: 16384
+    enable_prefix_caching: true
+    kv_cache_dtype: fp8
+  autoscaling:
+    min_replicas: 1
+    initial_replicas: 1
+    max_replicas: 4
+    target_ongoing_requests: 8
+    upscale_delay_s: 30
+    downscale_delay_s: 30
+  max_ongoing_requests: 8192
+
+benchmark:
+  generator: aiperf
+  mode: agentx_concurrency_ramp
+  duration_s: 210
+  grace_period_s: 30
+  post_load_observation_s: 90
+  workload:
+    type: agentx
+    public_dataset: semianalysis_cc_traces_weka_062126_256k
+    target_concurrency: 32
+    concurrency_ramp_duration_s: 150
+    trajectory_start_ratio: 0
+    seed: 42
+    # The scenario requires 900s runs; this is a short development run.
+    unsafe_override: true
+  streaming: true
+  fail_fast: true
+
+runtime:
+  endpoint_url: http://127.0.0.1:8000
+  readiness_timeout_s: 1800
+  keep_deployment: false
+  results_dir: runs
+
+analysis:
+  window_s: 5
+  tail_window_s: 30
+  status_interval_s: 1
+  metrics_interval_s: 2
+  generate_plots: true

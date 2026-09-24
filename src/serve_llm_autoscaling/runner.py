@@ -10,10 +10,19 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .artifacts import RunArtifacts, format_run_summary, write_json
-from .backend import RayServeBackend
+from .backend import RayServeBackend, check_routing_support, verify_topology
 from .benchmark import AIPerfRunner, aiperf_command
-from .config import CONTINUOUS_MODES, AgentXWorkloadConfig, ExperimentConfig, write_config
+from .config import (
+    CONTINUOUS_MODE_DIRS,
+    CONTINUOUS_MODES,
+    AgentXWorkloadConfig,
+    ExperimentConfig,
+    write_config,
+)
 from .telemetry import TelemetrySession
+from .windows import profiling_phase_ns
+
+LIFECYCLE_SCHEMA_VERSION = 1
 
 
 def _aiperf_version() -> str:
@@ -45,10 +54,115 @@ def environment_check(connect: bool = True) -> dict[str, Any]:
     return result
 
 
+def _run_job(
+    config: ExperimentConfig,
+    root: Path,
+    level: Any,
+    job: Callable[[], dict[str, Any]],
+    summary: list[dict[str, Any]],
+) -> None:
+    """Run one benchmark, recording a failure row unless ``fail_fast``."""
+    workload = config.benchmark.workload
+    try:
+        row = job()
+    except Exception as exc:
+        row = {"mode": config.benchmark.mode, "level": level}
+        if isinstance(workload, AgentXWorkloadConfig):
+            row["target_concurrency"] = workload.target_concurrency
+            row["ramp_duration_s"] = workload.concurrency_ramp_duration_s
+        row["error"] = f"{type(exc).__name__}: {exc}"
+        summary.append(row)
+        write_json(root / "benchmark" / "sweep_summary.json", summary)
+        if config.benchmark.fail_fast:
+            raise
+    else:
+        summary.append(row)
+        write_json(root / "benchmark" / "sweep_summary.json", summary)
+
+
+def lifecycle_record(
+    config: ExperimentConfig,
+    artifact_dir: Path,
+    *,
+    aiperf_launched_ns: int,
+    aiperf_exited_ns: int,
+    observation_end_ns: int | None = None,
+    observation_skipped: str | None = None,
+) -> dict[str, Any]:
+    """Epoch-ns boundaries of a continuous run's load, drain and idle periods.
+
+    Load issuance ends ``duration_s`` after profiling starts; AIPerf then
+    drains in-flight requests (up to ``grace_period_s``) and exits; the
+    harness then observes an idle deployment for ``post_load_observation_s``.
+    """
+    benchmark = config.benchmark
+    workload = benchmark.workload
+    start, phase_end = profiling_phase_ns(artifact_dir)
+
+    def offset(seconds: float) -> int | None:
+        return None if start is None else start + round(seconds * 1e9)
+
+    return {
+        "schema_version": LIFECYCLE_SCHEMA_VERSION,
+        "clock": "epoch_ns",
+        "aiperf_launched_ns": aiperf_launched_ns,
+        "profiling_start_ns": start,
+        "ramp_end_ns": (
+            offset(workload.concurrency_ramp_duration_s)
+            if isinstance(workload, AgentXWorkloadConfig) else None
+        ),
+        "load_end_ns": offset(benchmark.duration_s),
+        "profiling_phase_end_ns": phase_end,
+        "aiperf_exited_ns": aiperf_exited_ns,
+        "post_load_observation_s": benchmark.post_load_observation_s,
+        "observation_end_ns": observation_end_ns,
+        "observation_skipped": observation_skipped,
+    }
+
+
+def _run_continuous(
+    config: ExperimentConfig,
+    root: Path,
+    level: Any,
+    job: Callable[[], dict[str, Any]],
+    summary: list[dict[str, Any]],
+    observe: bool,
+) -> None:
+    """Run the single AIPerf process, then observe the idle deployment."""
+    artifact_dir = root / "benchmark" / CONTINUOUS_MODE_DIRS[config.benchmark.mode]
+    path = root / "benchmark" / "lifecycle.json"
+    launched = time.time_ns()
+    try:
+        _run_job(config, root, level, job, summary)
+    finally:
+        # Written even when fail_fast re-raises, which skips the observation.
+        exited = time.time_ns()
+        write_json(path, lifecycle_record(
+            config, artifact_dir, aiperf_launched_ns=launched, aiperf_exited_ns=exited,
+        ))
+    observation_s = config.benchmark.post_load_observation_s
+    if not observation_s:
+        return
+    if not observe:
+        write_json(path, lifecycle_record(
+            config, artifact_dir, aiperf_launched_ns=launched, aiperf_exited_ns=exited,
+            observation_skipped="no telemetry",
+        ))
+        return
+    time.sleep(observation_s)
+    write_json(path, lifecycle_record(
+        config, artifact_dir, aiperf_launched_ns=launched, aiperf_exited_ns=exited,
+        observation_end_ns=time.time_ns(),
+    ))
+
+
 def run_benchmarks(
     config: ExperimentConfig, root: Path, telemetry: TelemetrySession | None = None
 ) -> list[dict[str, Any]]:
-    """Run the configured benchmarks, collecting ``telemetry`` for their duration."""
+    """Run the configured benchmarks, collecting ``telemetry`` for their duration.
+
+    For continuous modes, telemetry also spans the post-load observation.
+    """
     runner = AIPerfRunner(config, root / "benchmark")
     summary: list[dict[str, Any]] = []
     workload = config.benchmark.workload
@@ -68,22 +182,12 @@ def run_benchmarks(
         ]
     # Collectors stop and flush on success, benchmark failure, or interrupt.
     with telemetry or nullcontext():
-        for level, job in jobs:
-            try:
-                row = job()
-            except Exception as exc:
-                row = {"mode": config.benchmark.mode, "level": level}
-                if isinstance(workload, AgentXWorkloadConfig):
-                    row["target_concurrency"] = workload.target_concurrency
-                    row["ramp_duration_s"] = workload.concurrency_ramp_duration_s
-                row["error"] = f"{type(exc).__name__}: {exc}"
-                summary.append(row)
-                write_json(root / "benchmark" / "sweep_summary.json", summary)
-                if config.benchmark.fail_fast:
-                    raise
-            else:
-                summary.append(row)
-                write_json(root / "benchmark" / "sweep_summary.json", summary)
+        if config.benchmark.mode in CONTINUOUS_MODES:
+            (level, job), = jobs
+            _run_continuous(config, root, level, job, summary, observe=telemetry is not None)
+        else:
+            for level, job in jobs:
+                _run_job(config, root, level, job, summary)
     return summary
 
 
@@ -139,6 +243,13 @@ def run_experiment(
         artifacts.manifest["environment"] = env
         artifacts.flush_manifest()
 
+        stage = "routing_preflight"
+        routing = {**backend.routing_summary(), "resolved": check_routing_support(config)}
+        routing_path = artifacts.root / "deployment" / "routing.json"
+        write_json(routing_path, routing)
+        artifacts.manifest["routing"] = routing["resolved"]
+        artifacts.flush_manifest()
+
         stage = "deploy"
         artifacts.record_event("deploy_started")
         write_json(
@@ -156,6 +267,12 @@ def run_experiment(
         artifacts.flush_manifest()
         write_json(artifacts.root / "deployment" / "ready_status.json", ready)
         artifacts.record_event("deployment_ready")
+
+        stage = "topology"
+        routing["verified"] = verify_topology(config, ready["serve_status"])
+        write_json(routing_path, routing)
+        artifacts.manifest["routing"] = {**routing["resolved"], **routing["verified"]}
+        artifacts.flush_manifest()
 
         stage = "benchmark"
         continuous = config.benchmark.mode in CONTINUOUS_MODES

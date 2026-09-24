@@ -110,7 +110,7 @@ def test_plot_data_aligns_epoch_timestamps(tmp_path: Path):
     root = make_run(tmp_path / "run")
     analyze_run(root, plot=False)
     data = json.loads((root / "analysis" / "plot_data.json").read_text())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["time_origin"] == {"profiling_start_ns": T0, "source": "phase_manifest",
                                    "profiling_end_s": 300.0}
     times = [s["relative_time_s"] for s in data["serve_status_samples"]]
